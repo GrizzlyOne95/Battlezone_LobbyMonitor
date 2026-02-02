@@ -1,6 +1,13 @@
 # Battlezone Redux Lobby Monitor
 
 A comprehensive external tool for monitoring, interacting with, and automating Battlezone 98 Redux multiplayer lobbies. This application provides a standalone interface for chat, lobby management, and analytics without needing to launch the full game.
+<img width="1084" height="745" alt="image" src="https://github.com/user-attachments/assets/58a33fd8-2fb1-40a7-aa13-ed497da3d008" />
+<img width="1192" height="848" alt="image" src="https://github.com/user-attachments/assets/57ca74b8-bdde-42f3-b62e-dfc782bc1d60" />
+<img width="1192" height="848" alt="image" src="https://github.com/user-attachments/assets/9a9702a8-7ac2-4a29-9c75-b117dcf01c72" />
+<img width="1192" height="848" alt="image" src="https://github.com/user-attachments/assets/076e508a-ccf5-44bb-a1fd-6092ec03e4f3" />
+<img width="1192" height="848" alt="image" src="https://github.com/user-attachments/assets/216469ce-a2fe-40c4-b756-ff8abe6fd405" />
+<img width="1002" height="732" alt="image" src="https://github.com/user-attachments/assets/42fdb52d-600b-4170-9a6e-b4282eb86238" />
+
 
 ## Features
 
@@ -78,4 +85,6 @@ To use the Relay features, navigate to the **Discord Integration** tab:
 
 ---
 
+
 *This tool is a community creation and is not officially affiliated with Rebellion.*
+
