@@ -20,6 +20,9 @@ import csv
 import ctypes
 import random
 from datetime import datetime, timedelta
+import tarfile
+import subprocess
+import shutil
 
 if sys.platform == 'win32':
     import winreg
@@ -86,6 +89,7 @@ class BZLobbyMonitor:
         self.last_welcome_times = {}
         self.last_claim_attempt = 0
         self.tray_icon = None
+        self.tor_process = None
         
         self.colors = {}
         self.load_config()
@@ -118,6 +122,7 @@ class BZLobbyMonitor:
             "proxy_enabled": False,
             "proxy_host": "",
             "proxy_port": "",
+            "proxy_type": "http",
             "minimize_on_close": False,
             "logging_enabled": False,
             "log_retention": 7,
@@ -485,6 +490,10 @@ class BZLobbyMonitor:
         ttk.Button(p_grid, text="Use Tor", command=self.set_tor_proxy).pack(side="left", padx=5)
         ttk.Button(p_grid, text="Test Proxy", command=self.test_proxy).pack(side="left", padx=5)
         
+        self.tor_status_var = tk.StringVar(value="Tor: Stopped")
+        self.tor_status_label = tk.Label(p_grid, textvariable=self.tor_status_var, fg="#666666", bg=self.colors["bg"], font=("Segoe UI", 9))
+        self.tor_status_label.pack(side="left", padx=5)
+        
         ttk.Label(p_grid, text="Status:").pack(side="left", padx=(10, 2))
         self.proxy_status_canvas = tk.Canvas(p_grid, width=20, height=20, highlightthickness=0, bg=self.colors["bg"])
         self.proxy_status_canvas.pack(side="left")
@@ -759,6 +768,7 @@ class BZLobbyMonitor:
         self.config["reconnect_delay"] = self.reconnect_delay_var.get()
         self.config["proxy_host"] = self.proxy_host_var.get()
         self.config["proxy_port"] = self.proxy_port_var.get()
+        # proxy_type is managed by buttons, not directly exposed in this UI save
         self.config["minimize_on_close"] = self.min_close_var.get()
         self.config["logging_enabled"] = self.log_enabled_var.get()
         self.config["log_retention"] = self.log_ret_var.get()
@@ -905,6 +915,8 @@ class BZLobbyMonitor:
         self.should_run = False
         if self.tray_icon:
             self.tray_icon.stop()
+        if self.tor_process:
+            self.stop_tor()
         self.save_config()
         self.root.destroy()
         sys.exit(0)
@@ -1332,10 +1344,12 @@ class BZLobbyMonitor:
         if self.config.get("proxy_enabled", False):
             host = self.config.get("proxy_host", "").strip()
             port = self.config.get("proxy_port", "").strip()
+            ptype = self.config.get("proxy_type", "http")
             if host and port:
                 proxy_opts["http_proxy_host"] = host
                 proxy_opts["http_proxy_port"] = port
-                self.log(f"Using Proxy: {host}:{port}")
+                proxy_opts["proxy_type"] = ptype
+                self.log(f"Using Proxy: {host}:{port} ({ptype})")
         
         self.ws = websocket.WebSocketApp(url,
                                   on_open=self.on_open,
@@ -1945,11 +1959,110 @@ class BZLobbyMonitor:
 
     # --- Proxy Tools ---
     def set_tor_proxy(self):
+        # Check for pysocks
+        try:
+            import socks
+        except ImportError:
+            messagebox.showerror("Missing Dependency", "To use Tor (SOCKS5), you must install 'pysocks'.\nRun: pip install pysocks")
+            return
+
+        if sys.platform == 'win32':
+            self.manage_tor_windows()
+        else:
+            # Linux/Mac: Assume system Tor
+            self.proxy_host_var.set("127.0.0.1")
+            self.proxy_port_var.set("9050")
+            self.proxy_enabled_var.set(True)
+            self.config["proxy_type"] = "socks5"
+            self.save_ui_config()
+            messagebox.showinfo("Tor Proxy", "Proxy set to 127.0.0.1:9050 (SOCKS5).\nEnsure the 'tor' service is running on your system.")
+
+    def manage_tor_windows(self):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        bin_dir = os.path.join(base_dir, "bin", "tor")
+        tor_exe = os.path.join(bin_dir, "tor.exe")
+        
+        if not os.path.exists(tor_exe):
+            if messagebox.askyesno("Tor Not Found", "Tor Expert Bundle is missing.\nDownload and configure it automatically?"):
+                self.download_tor(bin_dir)
+            else:
+                return
+
+        if os.path.exists(tor_exe):
+            self.start_tor(tor_exe, bin_dir)
+            
         self.proxy_host_var.set("127.0.0.1")
         self.proxy_port_var.set("9050")
         self.proxy_enabled_var.set(True)
+        self.config["proxy_type"] = "socks5"
         self.save_ui_config()
-        messagebox.showinfo("Tor Proxy", "Proxy set to 127.0.0.1:9050.\n\nNote: This tool uses HTTP CONNECT tunneling.\nEnsure your local Tor/Proxy exposes an HTTP interface,\nor use a wrapper like Privoxy if using standard Tor SOCKS.")
+        self.log("Tor Proxy Configured (127.0.0.1:9050)")
+
+    def download_tor(self, target_dir):
+        self.log("Downloading Tor Expert Bundle...")
+        # URL for Tor Expert Bundle Windows x86_64 (Stable)
+        url = "https://archive.torproject.org/tor-package-archive/torbrowser/14.0.4/tor-expert-bundle-14.0.4-windows-x86_64.tar.gz"
+        
+        try:
+            if not os.path.exists(target_dir):
+                os.makedirs(target_dir)
+                
+            tar_path = os.path.join(target_dir, "tor.tar.gz")
+            urllib.request.urlretrieve(url, tar_path)
+            
+            self.log("Extracting Tor...")
+            with tarfile.open(tar_path, "r:gz") as tar:
+                # Flatten structure: extract 'tor/tor.exe' directly to bin/tor/
+                for member in tar.getmembers():
+                    if "tor.exe" in member.name or "dll" in member.name:
+                        member.name = os.path.basename(member.name) # Strip paths
+                        tar.extract(member, target_dir)
+            
+            os.remove(tar_path)
+            
+            # Create default torrc
+            torrc_path = os.path.join(target_dir, "torrc")
+            data_dir = os.path.join(target_dir, "data")
+            if not os.path.exists(data_dir): os.makedirs(data_dir)
+            
+            with open(torrc_path, "w") as f:
+                f.write(f"SocksPort 9050\nDataDirectory {data_dir}\n")
+                
+            self.log("Tor installed successfully.")
+        except Exception as e:
+            self.log(f"Tor Download Error: {e}")
+            messagebox.showerror("Error", f"Failed to download Tor:\n{e}")
+
+    def start_tor(self, exe_path, cwd):
+        if self.tor_process:
+            return # Already running
+            
+        self.log("Starting Tor process...")
+        try:
+            # Hide console window
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+            self.tor_process = subprocess.Popen(
+                [exe_path, "-f", "torrc"], 
+                cwd=cwd,
+                startupinfo=startupinfo,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            self.log("Tor started in background.")
+            self.tor_status_var.set("Tor: Running")
+            self.tor_status_label.config(fg="#00ff00")
+        except Exception as e:
+            self.log(f"Failed to start Tor: {e}")
+
+    def stop_tor(self):
+        if self.tor_process:
+            self.log("Stopping Tor...")
+            self.tor_process.terminate()
+            self.tor_process = None
+            self.tor_status_var.set("Tor: Stopped")
+            self.tor_status_label.config(fg="#666666")
 
     def find_free_proxy(self):
         self.log("Searching for free proxies...")
@@ -1995,15 +2108,43 @@ class BZLobbyMonitor:
     def test_proxy(self):
         host = self.proxy_host_var.get()
         port = self.proxy_port_var.get()
+        ptype = self.config.get("proxy_type", "http")
         if not host or not port: return
         
         def run_test():
             self.root.after(0, lambda: self._set_proxy_indicator(None))
-            if self._test_proxy_connection(host, port):
-                self.log("Proxy Test: SUCCESS")
+            success = False
+            try:
+                if ptype == "socks5":
+                    import socks
+                    s = socks.socksocket()
+                    s.set_proxy(socks.SOCKS5, host, int(port))
+                    s.settimeout(10)
+                    s.connect(("api.ipify.org", 80))
+                    s.sendall(b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
+                    response = b""
+                    while True:
+                        data = s.recv(4096)
+                        if not data: break
+                        response += data
+                    s.close()
+                    body = response.split(b"\r\n\r\n")[1].decode('utf-8')
+                    self.log(f"Proxy Test (SOCKS5): SUCCESS. IP: {body}")
+                    success = True
+                elif self._test_proxy_connection(host, port):
+                    # For HTTP, try to get IP as well
+                    req = urllib.request.Request("http://api.ipify.org")
+                    req.set_proxy(f"{host}:{port}", "http")
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        ip = r.read().decode('utf-8')
+                        self.log(f"Proxy Test (HTTP): SUCCESS. IP: {ip}")
+                    success = True
+            except Exception as e:
+                self.log(f"Proxy Test Failed: {e}")
+
+            if success:
                 self.root.after(0, lambda: self._set_proxy_indicator(True))
             else:
-                self.log("Proxy Test: FAILED")
                 self.root.after(0, lambda: self._set_proxy_indicator(False))
         threading.Thread(target=run_test, daemon=True).start()
 
@@ -2011,6 +2152,7 @@ class BZLobbyMonitor:
         self.proxy_host_var.set(host)
         self.proxy_port_var.set(port)
         self.proxy_enabled_var.set(True)
+        self.config["proxy_type"] = "http" # Public lists are usually HTTP
         self.save_ui_config()
         self._set_proxy_indicator(True)
 
@@ -2029,6 +2171,13 @@ class BZLobbyMonitor:
                     self.root.after(0, lambda: self._set_proxy_indicator(None))
             else:
                 self.root.after(0, lambda: self._set_proxy_indicator(None))
+            
+            if self.tor_process:
+                if self.tor_process.poll() is not None:
+                    self.tor_process = None
+                    self.log("Tor process terminated unexpectedly.")
+                    self.root.after(0, lambda: self.tor_status_var.set("Tor: Stopped"))
+                    self.root.after(0, lambda: self.tor_status_label.config(fg="#ff0000"))
             
             for _ in range(30):
                 if not self.should_run: return
