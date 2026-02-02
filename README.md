@@ -6,6 +6,8 @@ A comprehensive external tool for monitoring, interacting with, and automating B
 <img width="1192" height="848" alt="image" src="https://github.com/user-attachments/assets/9a9702a8-7ac2-4a29-9c75-b117dcf01c72" />
 <img width="1192" height="848" alt="image" src="https://github.com/user-attachments/assets/076e508a-ccf5-44bb-a1fd-6092ec03e4f3" />
 <img width="1192" height="848" alt="image" src="https://github.com/user-attachments/assets/216469ce-a2fe-40c4-b756-ff8abe6fd405" />
+<img width="1002" height="732" alt="image" src="https://github.com/user-attachments/assets/42fdb52d-600b-4170-9a6e-b4282eb86238" />
+
 
 ## Features
 
@@ -85,3 +87,4 @@ To use the Relay features, navigate to the **Discord Integration** tab:
 
 
 *This tool is a community creation and is not officially affiliated with Rebellion.*
+
