@@ -23,6 +23,14 @@ from datetime import datetime, timedelta
 
 if sys.platform == 'win32':
     import winreg
+    import winsound
+
+try:
+    import pystray
+    from pystray import MenuItem as item, Icon
+    HAS_TRAY = True
+except ImportError:
+    HAS_TRAY = False
 
 # Try to import pypresence for Discord RPC
 try:
@@ -53,6 +61,13 @@ class BZLobbyMonitor:
         self.root.geometry("1000x700")
         self.root.minsize(800, 600)
         
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            icon_path = os.path.join(base_dir, "bzrmon.ico")
+            if os.path.exists(icon_path):
+                self.root.iconbitmap(icon_path)
+        except: pass
+        
         self.lobbies = {}
         self.ws = None
         self.ws_thread = None
@@ -68,6 +83,9 @@ class BZLobbyMonitor:
         self.geo_cache = {}
         self.rpc = None
         self.last_announce_time = time.time()
+        self.last_welcome_times = {}
+        self.last_claim_attempt = 0
+        self.tray_icon = None
         
         self.colors = {}
         self.load_config()
@@ -84,6 +102,9 @@ class BZLobbyMonitor:
         
         if HAS_RPC and self.config.get("rpc_enabled", False):
             self.init_rpc()
+            
+        if HAS_TRAY:
+            self.setup_tray()
         
         if not websocket:
             messagebox.showerror("Missing Dependency", "Please install 'websocket-client' to use this tool.\npip install websocket-client")
@@ -108,6 +129,8 @@ class BZLobbyMonitor:
             "alert_flash": False,
             "alert_watch_only": False,
             "watch_list": "",
+            "friend_list": "",
+            "ban_list": "",
             "alert_griefer": False,
             "run_on_startup": False,
             "filter_locked": False,
@@ -124,11 +147,18 @@ class BZLobbyMonitor:
             "reconnect_delay": 10,
             "bot_enabled": False,
             "bot_welcome_msg": "Welcome to the lobby, {player}!",
+            "bot_welcome_cooldown": 60,
             "bot_announce_enabled": False,
             "bot_announce_msg": "Join our Discord!",
             "bot_announce_interval": 5,
+            "auto_claim_enabled": False,
+            "auto_claim_name": "default",
+            "auto_claim_bot_name": "",
             "rpc_enabled": False,
-            "rpc_client_id": "133570000000000000" # Placeholder
+            "rpc_client_id": "133570000000000000", # Placeholder
+            "sound_join": "",
+            "sound_mention": "",
+            "sound_griefer": ""
         }
         if os.path.exists(CONFIG_FILE):
             try:
@@ -147,6 +177,8 @@ class BZLobbyMonitor:
                     if ctypes.windll.gdi32.AddFontResourceExW(font_path, 0x10, 0) > 0:
                         self.custom_font_name = "BZONE"
                 except: pass
+        else:
+            self.custom_font_name = "Monospace"
 
     def setup_styles(self):
         self.colors = {
@@ -180,6 +212,14 @@ class BZLobbyMonitor:
         
         self.root.configure(bg=c["bg"])
 
+    def flash_button_text(self, button, text, duration=2000):
+        if not button: return
+        try:
+            original_text = button.cget("text")
+            button.config(text=text)
+            self.root.after(duration, lambda: button.config(text=original_text) if button.winfo_exists() else None)
+        except: pass
+
     def save_config(self):
         try:
             with open(CONFIG_FILE, "w") as f:
@@ -205,11 +245,15 @@ class BZLobbyMonitor:
         self.stats_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.stats_tab, text="Statistics")
         
+        self.about_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.about_tab, text="About")
+        
         self.setup_lobby_tab()
         self.setup_config_tab()
         self.setup_discord_tab()
         self.setup_bot_tab()
         self.setup_stats_tab()
+        self.setup_about_tab()
 
     def create_scrollable_frame(self, parent):
         frame = ttk.Frame(parent)
@@ -290,16 +334,21 @@ class BZLobbyMonitor:
         ttk.Label(action_frame, text="New Lobby:").pack(side="left", padx=2)
         self.new_lobby_var = tk.StringVar(value="MyLobby")
         ttk.Entry(action_frame, textvariable=self.new_lobby_var, width=15).pack(side="left", padx=2)
-        ttk.Button(action_frame, text="Create", command=self.create_lobby).pack(side="left", padx=2)
+        self.create_btn = ttk.Button(action_frame, text="Create", command=self.create_lobby)
+        self.create_btn.pack(side="left", padx=2)
         
         ttk.Separator(action_frame, orient="vertical").pack(side="left", padx=5, fill="y")
         
-        ttk.Button(action_frame, text="Join Selected", command=self.join_selected_lobby).pack(side="left", padx=2)
+        self.join_btn = ttk.Button(action_frame, text="Join Selected", command=self.join_selected_lobby)
+        self.join_btn.pack(side="left", padx=2)
         self.leave_btn = ttk.Button(action_frame, text="Refresh Lounge", command=self.leave_or_refresh_lounge)
         self.leave_btn.pack(side="left", padx=2)
-        ttk.Button(action_frame, text="Join (Steam)", command=self.join_steam_lobby).pack(side="left", padx=2)
-        ttk.Button(action_frame, text="Post Status (Discord)", command=self.post_lobby_status).pack(side="left", padx=2)
-        ttk.Button(action_frame, text="Ping", command=self.ping_server).pack(side="left", padx=2)
+        self.steam_join_btn = ttk.Button(action_frame, text="Join (Steam)", command=self.join_steam_lobby)
+        self.steam_join_btn.pack(side="left", padx=2)
+        self.discord_status_btn = ttk.Button(action_frame, text="Post Status (Discord)", command=self.post_lobby_status)
+        self.discord_status_btn.pack(side="left", padx=2)
+        self.ping_btn = ttk.Button(action_frame, text="Ping", command=self.ping_server)
+        self.ping_btn.pack(side="left", padx=2)
 
         # Filters
         ttk.Label(action_frame, text="| Filters:").pack(side="left", padx=5)
@@ -366,7 +415,8 @@ class BZLobbyMonitor:
         self.chat_entry.pack(side="left", fill="x", expand=True)
         self.chat_entry.bind("<Return>", self.send_chat)
         
-        ttk.Button(chat_input_frame, text="Send", command=self.send_chat).pack(side="right", padx=2)
+        self.send_chat_btn = ttk.Button(chat_input_frame, text="Send", command=self.send_chat)
+        self.send_chat_btn.pack(side="right", padx=2)
 
         # 3. Player Details (Right)
         player_frame = ttk.LabelFrame(bottom_pane, text="Player Details", padding=5)
@@ -378,12 +428,21 @@ class BZLobbyMonitor:
         self.player_details_text.bind("<Button-3>", self.show_player_context_menu)
 
         # Configure tags for links
-        for widget in [self.lobby_details_text, self.player_details_text]:
+        for widget in [self.lobby_details_text, self.player_details_text, self.log_text]:
             widget.tag_config("link", foreground=self.colors["accent"], underline=1)
             widget.tag_bind("link", "<Enter>", lambda e, w=widget: w.config(cursor="hand2"))
             widget.tag_bind("link", "<Leave>", lambda e, w=widget: w.config(cursor=""))
             widget.tag_bind("link", "<Button-1>", self.on_link_click)
             widget.tag_config("griefer", foreground="red", font=("Segoe UI", 9, "bold"))
+            widget.tag_config("friend", foreground=self.colors["highlight"], font=("Segoe UI", 9, "bold"))
+
+        # Chat specific tags
+        self.log_text.tag_config("timestamp", foreground="#888888")
+        self.log_text.tag_config("author", foreground=self.colors["highlight"], font=(self.custom_font_name, 9, "bold"))
+        self.log_text.tag_config("mention", foreground="#ffffff", background="#555500")
+        
+        # Treeview tags
+        self.tree.tag_configure("friend", foreground=self.colors["highlight"])
 
     def setup_config_tab(self):
         scroll_frame = self.create_scrollable_frame(self.config_tab)
@@ -423,6 +482,7 @@ class BZLobbyMonitor:
         ttk.Entry(p_grid, textvariable=self.proxy_port_var, width=8).pack(side="left", padx=5)
         
         ttk.Button(p_grid, text="Find Free Proxy", command=self.find_free_proxy).pack(side="left", padx=10)
+        ttk.Button(p_grid, text="Use Tor", command=self.set_tor_proxy).pack(side="left", padx=5)
         ttk.Button(p_grid, text="Test Proxy", command=self.test_proxy).pack(side="left", padx=5)
         
         ttk.Label(p_grid, text="Status:").pack(side="left", padx=(10, 2))
@@ -496,6 +556,41 @@ class BZLobbyMonitor:
         self.alert_flash_var = tk.BooleanVar(value=self.config.get("alert_flash", False))
         ttk.Checkbutton(opts_frame, text="Flash Window", variable=self.alert_flash_var, command=self.save_ui_config).pack(side="left")
 
+        # --- Social & Audio ---
+        social_frame = ttk.LabelFrame(container, text="Social & Audio", padding=10)
+        social_frame.pack(fill="x", pady=5)
+
+        ttk.Label(social_frame, text="Friend List (Name or ID, one per line):").pack(anchor="w")
+        self.friend_list_text = tk.Text(social_frame, height=4, width=40, 
+                                       bg="#1a1a1a", fg=self.colors["highlight"], insertbackground=self.colors["highlight"], font=("Consolas", 9))
+        self.friend_list_text.pack(fill="x", pady=(0, 5))
+        self.friend_list_text.insert("1.0", self.config.get("friend_list", ""))
+        
+        # --- Security ---
+        sec_frame = ttk.LabelFrame(container, text="Security & Auto-Ban", padding=10)
+        sec_frame.pack(fill="x", pady=5)
+        ttk.Label(sec_frame, text="Auto-Ban List (Name, ID, or IP - one per line):").pack(anchor="w")
+        self.ban_list_text = tk.Text(sec_frame, height=4, width=40, 
+                                       bg="#1a1a1a", fg="#ff5555", insertbackground=self.colors["highlight"], font=("Consolas", 9))
+        self.ban_list_text.pack(fill="x", pady=(0, 5))
+        self.ban_list_text.insert("1.0", self.config.get("ban_list", ""))
+
+        ttk.Label(social_frame, text="Custom Audio Alerts (.wav):").pack(anchor="w", pady=(5, 0))
+        
+        def browse_wav(var):
+            f = filedialog.askopenfilename(filetypes=[("WAV Audio", "*.wav")])
+            if f: var.set(f)
+            self.save_ui_config()
+
+        for lbl, key in [("Player Join:", "sound_join"), ("Chat Mention:", "sound_mention"), ("Griefer:", "sound_griefer")]:
+            f = ttk.Frame(social_frame)
+            f.pack(fill="x", pady=1)
+            ttk.Label(f, text=lbl, width=15).pack(side="left")
+            var = tk.StringVar(value=self.config.get(key, ""))
+            setattr(self, f"{key}_var", var)
+            ttk.Entry(f, textvariable=var).pack(side="left", fill="x", expand=True, padx=5)
+            ttk.Button(f, text="...", width=3, command=lambda v=var: browse_wav(v)).pack(side="left")
+
     def setup_discord_tab(self):
         container = ttk.Frame(self.discord_tab, padding=20)
         container.pack(fill="both", expand=True)
@@ -553,6 +648,12 @@ class BZLobbyMonitor:
         self.bot_welcome_var = tk.StringVar(value=self.config.get("bot_welcome_msg", ""))
         ttk.Entry(greet_frame, textvariable=self.bot_welcome_var, width=60).pack(fill="x", pady=2)
         
+        cd_frame = ttk.Frame(greet_frame)
+        cd_frame.pack(fill="x", pady=2)
+        ttk.Label(cd_frame, text="Cooldown (s):").pack(side="left")
+        self.bot_welcome_cooldown_var = tk.IntVar(value=self.config.get("bot_welcome_cooldown", 60))
+        ttk.Spinbox(cd_frame, from_=0, to=3600, textvariable=self.bot_welcome_cooldown_var, width=5).pack(side="left", padx=5)
+        
         # Announcements
         ann_frame = ttk.LabelFrame(container, text="Timed Announcements", padding=10)
         ann_frame.pack(fill="x", pady=5)
@@ -567,6 +668,21 @@ class BZLobbyMonitor:
         ttk.Label(ann_frame, text="Interval (Minutes):").pack(anchor="w", pady=(5,0))
         self.bot_announce_int_var = tk.IntVar(value=self.config.get("bot_announce_interval", 5))
         ttk.Spinbox(ann_frame, from_=1, to=120, textvariable=self.bot_announce_int_var, width=5).pack(anchor="w", pady=2)
+        
+        # Auto-Claim
+        claim_frame = ttk.LabelFrame(container, text="Auto-Claim Lobby", padding=10)
+        claim_frame.pack(fill="x", pady=5)
+        
+        self.auto_claim_enabled_var = tk.BooleanVar(value=self.config.get("auto_claim_enabled", False))
+        ttk.Checkbutton(claim_frame, text="Enable Auto-Claim (Recreate if missing)", variable=self.auto_claim_enabled_var, command=self.save_ui_config).pack(anchor="w")
+        
+        ttk.Label(claim_frame, text="Lobby Name:").pack(side="left")
+        self.auto_claim_name_var = tk.StringVar(value=self.config.get("auto_claim_name", "default"))
+        ttk.Entry(claim_frame, textvariable=self.auto_claim_name_var, width=20).pack(side="left", padx=5)
+        
+        ttk.Label(claim_frame, text="Bot Name:").pack(side="left", padx=(5, 0))
+        self.auto_claim_bot_name_var = tk.StringVar(value=self.config.get("auto_claim_bot_name", ""))
+        ttk.Entry(claim_frame, textvariable=self.auto_claim_bot_name_var, width=15).pack(side="left", padx=5)
         
         # RPC Settings
         rpc_frame = ttk.LabelFrame(container, text="Discord Rich Presence (Local)", padding=10)
@@ -593,6 +709,36 @@ class BZLobbyMonitor:
         self.stats_canvas = tk.Canvas(container, bg="#1a1a1a", highlightthickness=0)
         self.stats_canvas.pack(fill="both", expand=True)
         self.stats_canvas.bind("<Configure>", lambda e: self.draw_stats())
+
+    def setup_about_tab(self):
+        container = ttk.Frame(self.about_tab, padding=40)
+        container.pack(fill="both", expand=True)
+        
+        # Title
+        ttk.Label(container, text="Battlezone Redux Lobby Monitor", 
+                 font=(self.custom_font_name, 20, "bold"), 
+                 foreground=self.colors["highlight"]).pack(pady=(0, 30))
+        
+        # Disclaimer Box
+        info_frame = ttk.LabelFrame(container, text=" Disclaimer ", padding=20)
+        info_frame.pack(fill="both", expand=True)
+        
+        disclaimer_text = (
+            "This tool is created solely for the purpose of helping the community organize games "
+            "and monitor lobby status. It is intended to facilitate fair play and coordination.\n\n"
+            "It should NOT be used to harass players, disrupt lobbies, or cause problems within the community. "
+            "Please use this tool responsibly.\n\n"
+            "This application is NOT affiliated with, endorsed by, or connected to Rebellion Developments "
+            "in any way. It simply leverages publicly available WebSocket protocols used by the game client."
+        )
+        
+        lbl = ttk.Label(info_frame, text=disclaimer_text, font=(self.custom_font_name, 11), 
+                        wraplength=600, justify="center")
+        lbl.pack(expand=True)
+        
+        ttk.Label(container, text="Developed by the Community", 
+                 font=(self.custom_font_name, 9, "italic"), 
+                 foreground="gray").pack(side="bottom", pady=10)
 
     def sort_tree(self, col, reverse):
         l = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
@@ -624,6 +770,11 @@ class BZLobbyMonitor:
         self.config["alert_flash"] = self.alert_flash_var.get()
         self.config["alert_watch_only"] = self.alert_watch_only_var.get()
         self.config["watch_list"] = self.watch_list_text.get("1.0", "end-1c")
+        self.config["friend_list"] = self.friend_list_text.get("1.0", "end-1c")
+        self.config["ban_list"] = self.ban_list_text.get("1.0", "end-1c")
+        self.config["sound_join"] = self.sound_join_var.get()
+        self.config["sound_mention"] = self.sound_mention_var.get()
+        self.config["sound_griefer"] = self.sound_griefer_var.get()
         self.config["alert_griefer"] = self.alert_griefer_var.get()
         self.config["run_on_startup"] = self.startup_var.get()
         self.config["filter_locked"] = self.filter_locked_var.get()
@@ -637,9 +788,13 @@ class BZLobbyMonitor:
         self.config["discord_relay_to_lobby"] = self.discord_to_lobby_var.get()
         self.config["bot_enabled"] = self.bot_enabled_var.get()
         self.config["bot_welcome_msg"] = self.bot_welcome_var.get()
+        self.config["bot_welcome_cooldown"] = self.bot_welcome_cooldown_var.get()
         self.config["bot_announce_enabled"] = self.bot_announce_enabled_var.get()
         self.config["bot_announce_msg"] = self.bot_announce_msg_var.get()
         self.config["bot_announce_interval"] = self.bot_announce_int_var.get()
+        self.config["auto_claim_enabled"] = self.auto_claim_enabled_var.get()
+        self.config["auto_claim_name"] = self.auto_claim_name_var.get()
+        self.config["auto_claim_bot_name"] = self.auto_claim_bot_name_var.get()
         self.config["rpc_enabled"] = self.rpc_enabled_var.get()
         self.config["rpc_client_id"] = self.rpc_id_var.get()
         self.save_config()
@@ -660,31 +815,50 @@ class BZLobbyMonitor:
         self.toggle_discord_relay()
 
     def set_startup(self, enable):
-        if sys.platform != 'win32': return
-        try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_ALL_ACCESS)
-            if enable:
-                if getattr(sys, 'frozen', False):
-                    path = f'"{sys.executable}"'
+        if sys.platform == 'win32':
+            try:
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_ALL_ACCESS)
+                if enable:
+                    if getattr(sys, 'frozen', False):
+                        path = f'"{sys.executable}"'
+                    else:
+                        path = f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
+                    winreg.SetValueEx(key, "BZLobbyMonitor", 0, winreg.REG_SZ, path)
                 else:
-                    path = f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
-                winreg.SetValueEx(key, "BZLobbyMonitor", 0, winreg.REG_SZ, path)
-            else:
-                try:
-                    winreg.DeleteValue(key, "BZLobbyMonitor")
-                except FileNotFoundError:
-                    pass
-            winreg.CloseKey(key)
-        except Exception as e:
-            self.log(f"Startup registry error: {e}")
+                    try:
+                        winreg.DeleteValue(key, "BZLobbyMonitor")
+                    except FileNotFoundError:
+                        pass
+                winreg.CloseKey(key)
+            except Exception as e:
+                self.log(f"Startup registry error: {e}")
+        elif sys.platform.startswith('linux'):
+            try:
+                autostart_dir = os.path.expanduser("~/.config/autostart")
+                desktop_file = os.path.join(autostart_dir, "bzr_monitor.desktop")
+                if enable:
+                    if not os.path.exists(autostart_dir): os.makedirs(autostart_dir)
+                    exec_cmd = sys.executable if getattr(sys, 'frozen', False) else f"{sys.executable} {os.path.abspath(sys.argv[0])}"
+                    content = f"[Desktop Entry]\nType=Application\nName=Battlezone Lobby Monitor\nExec={exec_cmd}\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true\nComment=Start BZR Monitor\n"
+                    with open(desktop_file, "w") as f: f.write(content)
+                else:
+                    if os.path.exists(desktop_file): os.remove(desktop_file)
+            except Exception as e:
+                self.log(f"Startup setup error: {e}")
 
     def on_window_close_attempt(self):
         self.root.iconify()
+        if HAS_TRAY and self.tray_icon:
+            self.root.withdraw()
+            # Tray icon runs in background thread, no action needed
 
     def trigger_alert(self, alert_type, data=None):
         should_alert = False
+        sound_key = None
+        
         if alert_type == "new_lobby" and self.config.get("alert_new_lobby"): should_alert = True
         elif alert_type == "player_join" and self.config.get("alert_player_join"):
+            sound_key = "sound_join"
             if self.config.get("alert_watch_only"):
                 watch_list = self.config.get("watch_list", "").lower().splitlines()
                 # data is player name
@@ -693,20 +867,44 @@ class BZLobbyMonitor:
             else:
                 should_alert = True
         elif alert_type == "griefer_join" and self.config.get("alert_griefer"): should_alert = True
+        elif alert_type == "griefer_join" and self.config.get("alert_griefer"): 
+            should_alert = True
+            sound_key = "sound_griefer"
         elif alert_type == "disconnect" and self.config.get("alert_disconnect"): should_alert = True
             
         if should_alert:
             if self.config.get("alert_sound"): self.root.bell()
+            if self.config.get("alert_sound"): 
+                self.play_custom_sound(sound_key)
             if self.config.get("alert_flash"): self.flash_window()
+
+    def play_custom_sound(self, config_key):
+        played = False
+        if config_key:
+            path = self.config.get(config_key, "")
+            if path and os.path.exists(path) and sys.platform == 'win32':
+                try:
+                    winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                    played = True
+                except: pass
+        
+        if not played:
+            self.root.bell()
 
     def flash_window(self):
         if sys.platform == 'win32':
             try:
                 ctypes.windll.user32.FlashWindow(int(self.root.wm_frame(), 16), True)
             except: pass
+        else:
+            try:
+                self.root.wm_attributes("-demands-attention", True)
+            except: pass
 
     def quit_app(self):
         self.should_run = False
+        if self.tray_icon:
+            self.tray_icon.stop()
         self.save_config()
         self.root.destroy()
         sys.exit(0)
@@ -718,9 +916,49 @@ class BZLobbyMonitor:
         elif game == "Battlezone Combat Commander":
             self.host_var.set("battlezone99mp.webdev.rebellion.co.uk:61111")
 
-    def create_lobby(self):
-        name = self.new_lobby_var.get()
-        if not name: return
+    def setup_tray(self):
+        if not HAS_TRAY: return
+        
+        def show_window(icon, item):
+            self.root.after(0, self.root.deiconify)
+
+        def quit_tray(icon, item):
+            self.root.after(0, self.quit_app)
+
+        image = None
+        if HAS_PIL:
+            # Create a simple icon if none exists
+            try:
+                # Try to load existing icon
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                icon_path = os.path.join(base_dir, "bzrmon.ico")
+                if not os.path.exists(icon_path):
+                    icon_path = os.path.join(base_dir, "bzrtex.ico") # Reuse existing if available
+                if not os.path.exists(icon_path):
+                    icon_path = os.path.join(base_dir, "wb.ico")
+                
+                if os.path.exists(icon_path):
+                    image = Image.open(icon_path)
+                else:
+                    image = Image.new('RGB', (64, 64), color = (0, 255, 0))
+            except: pass
+
+        if image:
+            menu = (item('Show', show_window), item('Quit', quit_tray))
+            self.tray_icon = pystray.Icon("name", image, "BZ Monitor", menu)
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def create_lobby(self, name=None):
+        if not self.connected:
+            self.flash_button_text(self.create_btn, "Not Connected")
+            return
+            
+        if name is None:
+            name = self.new_lobby_var.get()
+        if not name:
+            self.flash_button_text(self.create_btn, "Enter Name")
+            return
+            
         # Add prefix for chat lobbies as per JS client
         full_name = f"~chat~pub~~{name}"
         msg = {"type": "CreateLobby", "content": {
@@ -734,14 +972,18 @@ class BZLobbyMonitor:
             self.log(f"Requesting Create Lobby: {name}")
 
     def join_selected_lobby(self):
+        if not self.connected:
+            self.flash_button_text(self.join_btn, "Not Connected")
+            return
+            
         selected_items = self.tree.selection()
         if not selected_items:
-            messagebox.showinfo("Info", "No lobby selected.")
+            self.flash_button_text(self.join_btn, "Select Lobby")
             return
             
         # Prevent joining a lobby if already in one
         if self.current_lobby_id is not None:
-            messagebox.showwarning("Warning", "You are already in a lobby. Please leave it first.")
+            self.flash_button_text(self.join_btn, "Already in Lobby")
             return
             
         val = self.tree.item(selected_items[0])['values'][0]
@@ -757,7 +999,10 @@ class BZLobbyMonitor:
 
     def join_steam_lobby(self):
         selected_items = self.tree.selection()
-        if not selected_items: return
+        if not selected_items:
+            self.flash_button_text(self.steam_join_btn, "Select Lobby")
+            return
+            
         lid = str(self.tree.item(selected_items[0])['values'][0])
         lobby = self.lobbies.get(lid)
         if not lobby: return
@@ -783,6 +1028,9 @@ class BZLobbyMonitor:
                 menu = tk.Menu(self.root, tearoff=0)
                 menu.add_command(label=f"Add '{name}' to Watch List", command=lambda: self.add_to_watch_list(name))
                 menu.add_command(label=f"Add ID '{uid}' to Watch List", command=lambda: self.add_to_watch_list(uid))
+                
+                menu.add_command(label=f"Add '{name}' to Friends", command=lambda: self.add_to_friend_list(name))
+                menu.add_command(label=f"Add '{name}' to Ban List", command=lambda: self.add_to_ban_list(name))
                 
                 menu.add_separator()
                 menu.add_command(label=f"Whisper '{name}'", command=lambda: self.whisper_user(name))
@@ -812,6 +1060,21 @@ class BZLobbyMonitor:
         self.save_ui_config()
         messagebox.showinfo("Watch List", f"Added '{text}' to watch list.")
 
+    def add_to_friend_list(self, text):
+        current = self.friend_list_text.get("1.0", "end-1c")
+        new_text = (current + "\n" + text).strip()
+        self.friend_list_text.delete("1.0", "end")
+        self.friend_list_text.insert("1.0", new_text)
+        self.save_ui_config()
+        self.refresh_tree()
+
+    def add_to_ban_list(self, text):
+        current = self.ban_list_text.get("1.0", "end-1c")
+        new_text = (current + "\n" + text).strip()
+        self.ban_list_text.delete("1.0", "end")
+        self.ban_list_text.insert("1.0", new_text)
+        self.save_ui_config()
+
     def whisper_user(self, name):
         msg = simpledialog.askstring("Whisper", f"Message to {name}:")
         if msg:
@@ -834,6 +1097,10 @@ class BZLobbyMonitor:
             self.log(f"Kicked {name}")
 
     def leave_or_refresh_lounge(self):
+        if not self.connected:
+            self.flash_button_text(self.leave_btn, "Not Connected")
+            return
+            
         if self.current_lobby_id is not None:
             msg = {"type": "DoExitLobby", "content": self.current_lobby_id}
             self.log(f"Requesting Exit Lobby: {self.current_lobby_id}")
@@ -845,8 +1112,16 @@ class BZLobbyMonitor:
             self.ws.send(json.dumps(msg))
 
     def send_chat(self, event=None):
+        if not self.connected:
+            if hasattr(self, 'send_chat_btn'):
+                self.flash_button_text(self.send_chat_btn, "Not Connected")
+            return
+            
         text = self.chat_var.get()
-        if not text: return
+        if not text:
+            if hasattr(self, 'send_chat_btn'):
+                self.flash_button_text(self.send_chat_btn, "Empty")
+            return
         self.send_chat_message(text)
         self.chat_var.set("")
 
@@ -856,6 +1131,10 @@ class BZLobbyMonitor:
             self.ws.send(json.dumps(msg))
             
     def ping_server(self):
+        if not self.connected:
+            self.flash_button_text(self.ping_btn, "Not Connected")
+            return
+            
         if self.ws and self.connected:
             self.ws.send(json.dumps({"type": "Ping", "content": True}))
             self.ws.send(json.dumps({"type": "DoPing", "content": True}))
@@ -879,6 +1158,40 @@ class BZLobbyMonitor:
     def log(self, message):
         self.root.after(0, lambda: self._log_impl(message))
 
+    def log_chat(self, author, text):
+        self.root.after(0, lambda: self._log_chat_impl(author, text))
+
+    def _log_chat_impl(self, author, text):
+        self.log_text.config(state="normal")
+        
+        # Timestamp & Author
+        ts = datetime.now().strftime("[%H:%M:%S]")
+        self.log_text.insert("end", f"{ts} ", "timestamp")
+        self.log_text.insert("end", f"[{author}]: ", "author")
+        
+        # Parse URLs and Mentions
+        parts = re.split(r'(https?://\S+)', text)
+        my_name = self.name_var.get().lower()
+        
+        for part in parts:
+            if part.startswith("http"):
+                self.log_text.insert("end", part, ("link", f"url:{part}"))
+            else:
+                # Check mentions (case-insensitive)
+                if my_name and my_name in part.lower():
+                    self.log_text.insert("end", part, "mention")
+                    if self.config.get("alert_sound"): self.play_custom_sound("sound_mention")
+                else:
+                    self.log_text.insert("end", part)
+                    
+        self.log_text.insert("end", "\n")
+        self.log_text.see("end")
+        self.log_text.config(state="disabled")
+        
+        # File Log
+        if self.config.get("logging_enabled", False):
+            self._file_log(f"[CHAT] {author}: {text}")
+
     def _log_impl(self, message):
         # UI Log
         self.log_text.config(state="normal")
@@ -888,6 +1201,9 @@ class BZLobbyMonitor:
         
         # File Log
         if self.config.get("logging_enabled", False):
+            self._file_log(message)
+
+    def _file_log(self, message):
             try:
                 folder = self.config.get("log_folder", "")
                 if not folder or not os.path.exists(folder):
@@ -1036,6 +1352,14 @@ class BZLobbyMonitor:
         
         # Send Auth
         name = self.name_var.get()
+        
+        # Auto-Claim Bot Name Override
+        if self.config.get("auto_claim_enabled", False):
+            bot_name = self.config.get("auto_claim_bot_name", "")
+            if bot_name:
+                name = bot_name
+                self.log(f"Using Auto-Claim Bot Name: {name}")
+        
         auth_data = {
             "type": "Authorization",
             "content": {
@@ -1118,6 +1442,12 @@ class BZLobbyMonitor:
         
     def set_player_data(self):
         name = self.name_var.get()
+        
+        if self.config.get("auto_claim_enabled", False):
+            bot_name = self.config.get("auto_claim_bot_name", "")
+            if bot_name:
+                name = bot_name
+        
         if not name: name = f"User_{self.my_id}"
         
         # Send player data updates similar to ConnectionManager.js
@@ -1140,6 +1470,7 @@ class BZLobbyMonitor:
         self.log(f"Received Full Lobby List: {len(self.lobbies)} lobbies.")
         self.root.after(0, self.refresh_tree)
         self.root.after(0, self.check_and_update_current_lobby)
+        self.root.after(2000, self.check_auto_claim)
 
     def handle_lobby_changed(self, data):
         if "lobbies" in data:
@@ -1158,6 +1489,7 @@ class BZLobbyMonitor:
             if str(lid) not in self.lobbies:
                 self.trigger_alert("new_lobby")
             self.lobbies[str(lid)] = lobby
+            self.check_auto_ban_lobby(str(lid))
         self.log(f"Lobbies Updated: {list(changed_lobbies.keys())}")
         self.root.after(0, self.refresh_tree)
         self.root.after(0, self.check_and_update_current_lobby)
@@ -1186,6 +1518,7 @@ class BZLobbyMonitor:
             del self.lobbies[lid]
             self.root.after(0, self.refresh_tree)
             self.log(f"Lobby Removed: {lid}")
+            self.root.after(2000, self.check_auto_claim)
         if self.current_lobby_id is not None and self.current_lobby_id == int(lid):
             self.log("Current lobby was removed. Returning to lounge.")
             self.check_and_update_current_lobby()
@@ -1219,6 +1552,7 @@ class BZLobbyMonitor:
         
         text = chat.get('text', '')
         self.log(f"[CHAT] {author}: {text}")
+        self.log_chat(author, text)
         
         # Relay to Discord
         if self.config.get("discord_enabled", False) and self.config.get("discord_relay_to_discord", True):
@@ -1229,21 +1563,71 @@ class BZLobbyMonitor:
     def handle_member_list_changed(self, data):
         member = data.get("member")
         lid = data.get("lobbyId")
+        uid = data.get("id", member)
         action = "left" if data.get("removed") else "joined"
         self.log(f"User {member} {action} lobby {lid}")
         if not data.get("removed"):
             self.trigger_alert("player_join", member)
+            self.check_auto_ban_join(lid, uid, member)
             
             # Bot Welcome
             if self.config.get("bot_enabled", False) and self.connected:
                 if self.current_lobby_id == int(lid):
-                     msg = self.config.get("bot_welcome_msg", "")
-                     if msg:
-                         final_msg = msg.replace("{player}", member)
-                         self.send_chat_message(final_msg)
+                     cooldown = self.config.get("bot_welcome_cooldown", 60)
+                     last_time = self.last_welcome_times.get(uid, 0)
+                     if time.time() - last_time > cooldown:
+                         msg = self.config.get("bot_welcome_msg", "")
+                         if msg:
+                             final_msg = msg.replace("{player}", member)
+                             self.send_chat_message(final_msg)
+                             self.last_welcome_times[uid] = time.time()
+                     else:
+                         self.log(f"Welcome suppressed for {member} (Cooldown active)")
                          
         # Refresh details if we are looking at this lobby
         self.check_and_update_current_lobby()
+
+    def check_auto_ban_join(self, lid, uid, name):
+        # Fast check on join (Name/ID only, IP might not be ready)
+        lobby = self.lobbies.get(str(lid))
+        if not lobby: return
+        
+        owner = str(lobby.get("owner", ""))
+        if owner != str(self.my_id): return # We only ban in our lobbies
+        
+        ban_list = self.config.get("ban_list", "").lower().splitlines()
+        ban_list = [b.strip() for b in ban_list if b.strip()]
+        
+        if str(uid).lower() in ban_list or name.lower() in ban_list:
+            self._auto_kick(uid, name, "Auto-Ban (ID/Name Match)")
+
+    def check_auto_ban_lobby(self, lid):
+        # Deep check on lobby update (Includes IPs)
+        lobby = self.lobbies.get(str(lid))
+        if not lobby: return
+        
+        owner = str(lobby.get("owner", ""))
+        if owner != str(self.my_id): return
+        
+        ban_list = self.config.get("ban_list", "").lower().splitlines()
+        ban_list = [b.strip() for b in ban_list if b.strip()]
+        if not ban_list: return
+
+        users = lobby.get("users", {})
+        for uid, u_data in users.items():
+            if str(uid) == str(self.my_id): continue
+            
+            name = u_data.get("name", "").lower()
+            ip = u_data.get("ipAddress", "").lower()
+            
+            if (str(uid).lower() in ban_list or 
+                name in ban_list or 
+                (ip and ip != "unknown" and ip in ban_list)):
+                self._auto_kick(uid, u_data.get("name", "Unknown"), "Auto-Ban (IP/ID Match)")
+
+    def _auto_kick(self, uid, name, reason):
+        self.log(f"!!! KICKING {name} (ID: {uid}) - Reason: {reason} !!!")
+        self.ws.send(json.dumps({"type": "DoKickUser", "content": int(uid) if str(uid).isdigit() else uid}))
 
     def handle_user_data_changed(self, data):
         member = data.get("member")
@@ -1303,6 +1687,7 @@ class BZLobbyMonitor:
             self.tree.delete(item)
             
         # Repopulate
+        friends = self.config.get("friend_list", "").lower().splitlines()
         for lid, lobby in self.lobbies.items():
             meta = lobby.get("metadata", {})
             raw_name = meta.get("name", "Unknown")
@@ -1318,6 +1703,14 @@ class BZLobbyMonitor:
             
             # Calculate player count
             users = lobby.get("users", {})
+            
+            # Check for friends
+            has_friend = False
+            for uid, u_data in users.items():
+                u_name = u_data.get('name', '').lower()
+                if any(f.strip() in u_name or f.strip() in str(uid).lower() for f in friends if f.strip()):
+                    has_friend = True
+                    break
             
             if self.filter_locked_var.get() and lobby.get("isLocked"): continue
             if self.filter_full_var.get() and len(users) >= lobby.get('memberLimit', 0): continue
@@ -1342,7 +1735,8 @@ class BZLobbyMonitor:
                 if len(parts) >= 2: map_name = parts[1]
             if map_name == "unknown": map_name = "?"
             
-            self.tree.insert("", "end", values=(lid, name, map_name, owner, player_count, game_type, version, locked, is_private))
+            tags = ("friend",) if has_friend else ()
+            self.tree.insert("", "end", values=(lid, name, map_name, owner, player_count, game_type, version, locked, is_private), tags=tags)
 
         # Restore selection if possible
         if selected_id:
@@ -1415,6 +1809,7 @@ class BZLobbyMonitor:
         self.player_details_text.delete("1.0", "end")
         
         users = lobby.get("users", {})
+        friends = self.config.get("friend_list", "").lower().splitlines()
         for uid, user in users.items():
             user_name = user.get('name', 'Unknown')
             user_meta = user.get('metadata', {})
@@ -1424,6 +1819,12 @@ class BZLobbyMonitor:
                 user_name = user_meta.get('name', 'Unknown')
                 
             self.player_details_text.insert("end", f" - {user_name} (ID: {uid})\n")
+            is_friend = any(f.strip() in user_name.lower() or f.strip() in str(uid).lower() for f in friends if f.strip())
+            
+            self.player_details_text.insert("end", f" - {user_name} (ID: {uid})", "friend" if is_friend else "")
+            if is_friend:
+                self.player_details_text.insert("end", " [FRIEND]", "friend")
+            self.player_details_text.insert("end", "\n")
             self.player_details_text.insert("end", f"   IP: {user.get('ipAddress')}\n")
             self.player_details_text.insert("end", f"   Auth: {user.get('authType')}\n")
             
@@ -1543,6 +1944,13 @@ class BZLobbyMonitor:
             self.pending_fetches.discard(target_id)
 
     # --- Proxy Tools ---
+    def set_tor_proxy(self):
+        self.proxy_host_var.set("127.0.0.1")
+        self.proxy_port_var.set("9050")
+        self.proxy_enabled_var.set(True)
+        self.save_ui_config()
+        messagebox.showinfo("Tor Proxy", "Proxy set to 127.0.0.1:9050.\n\nNote: This tool uses HTTP CONNECT tunneling.\nEnsure your local Tor/Proxy exposes an HTTP interface,\nor use a wrapper like Privoxy if using standard Tor SOCKS.")
+
     def find_free_proxy(self):
         self.log("Searching for free proxies...")
         threading.Thread(target=self._find_proxy_worker, daemon=True).start()
@@ -1735,8 +2143,12 @@ class BZLobbyMonitor:
         threading.Thread(target=_send, daemon=True).start()
 
     def post_lobby_status(self):
+        if not self.connected:
+            self.flash_button_text(self.discord_status_btn, "Not Connected")
+            return
+            
         if self.current_lobby_id is None:
-            messagebox.showinfo("Info", "Not in a lobby.")
+            self.flash_button_text(self.discord_status_btn, "Not in Lobby")
             return
             
         lobby = self.lobbies.get(str(self.current_lobby_id))
@@ -1847,6 +2259,38 @@ class BZLobbyMonitor:
                         self.send_chat_message(msg)
                         self.last_announce_time = time.time()
             time.sleep(10)
+
+    def check_auto_claim(self):
+        if not self.config.get("auto_claim_enabled", False): return
+        if not self.connected: return
+        if self.current_lobby_id is not None: return
+        
+        if time.time() - self.last_claim_attempt < 10: return
+
+        target_name = self.config.get("auto_claim_name", "")
+        if not target_name: return
+
+        found = False
+        for lid, lobby in self.lobbies.items():
+            meta = lobby.get("metadata", {})
+            raw_name = meta.get("name", "")
+            clean_name = raw_name.split("~~")[-1] if "~~" in raw_name else raw_name
+            if clean_name.lower() == target_name.lower():
+                found = True
+                break
+        
+        if not found:
+            self.log(f"Auto-Claim: Lobby '{target_name}' missing. Creating...")
+            
+            # Force name reclaim in case we were using a backup name (e.g. !BRIDGE(1))
+            bot_name = self.config.get("auto_claim_bot_name", "")
+            if bot_name:
+                self.log(f"Reclaiming identity: {bot_name}")
+                self.ws.send(json.dumps({"type": "SetPlayerData", "content": {"key": "name", "value": bot_name}}))
+                self.ws.send(json.dumps({"type": "SetPlayerData", "content": {"key": "playerName", "value": bot_name}}))
+            
+            self.create_lobby(target_name)
+            self.last_claim_attempt = time.time()
 
     def get_geo_info(self, ip):
         if ip in self.geo_cache: return self.geo_cache[ip]
@@ -2136,10 +2580,14 @@ if __name__ == "__main__":
         
         def _fetch():
             try:
-                with urllib.request.urlopen(f"http://ip-api.com/json/{ip}") as r:
+                with urllib.request.urlopen(f"http://ip-api.com/json/{ip}?fields=status,countryCode,timezone,offset") as r:
                     data = json.loads(r.read().decode())
                     if data.get("status") == "success":
-                        info = f"[{data.get('countryCode')}] {data.get('timezone')}"
+                        offset = data.get('offset', 0)
+                        hours = int(offset / 3600)
+                        minutes = int((abs(offset) % 3600) / 60)
+                        utc_str = f"UTC{'+' if hours >= 0 else ''}{hours}:{minutes:02d}"
+                        info = f"[{data.get('countryCode')}] {data.get('timezone')} ({utc_str})"
                         self.geo_cache[ip] = info
                         # Refresh UI if this player is currently shown
                         self.root.after(0, lambda: self.on_lobby_select(None))
