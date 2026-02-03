@@ -21,8 +21,10 @@ import ctypes
 import random
 from datetime import datetime, timedelta
 import tarfile
+import zipfile
 import subprocess
 import shutil
+import base64
 
 if sys.platform == 'win32':
     import winreg
@@ -45,6 +47,10 @@ except ImportError:
 # Try to import websocket-client
 try:
     import websocket
+    # Ensure we have the correct library (websocket-client) which has WebSocketApp
+    if not hasattr(websocket, 'WebSocketApp'):
+        print("WARNING: Incorrect 'websocket' package detected. Please install 'websocket-client'.", file=sys.stderr)
+        websocket = None
 except ImportError:
     websocket = None
 
@@ -90,6 +96,8 @@ class BZLobbyMonitor:
         self.last_claim_attempt = 0
         self.tray_icon = None
         self.tor_process = None
+        self.raknet_query = None # Custom payload for RakNet connected state
+        self.tx_rel_seq = -1 # Reliable Message Sequence Number
         
         self.colors = {}
         self.load_config()
@@ -354,6 +362,8 @@ class BZLobbyMonitor:
         self.discord_status_btn.pack(side="left", padx=2)
         self.ping_btn = ttk.Button(action_frame, text="Ping", command=self.ping_server)
         self.ping_btn.pack(side="left", padx=2)
+        self.debug_btn = ttk.Button(action_frame, text="RakNet Debug", command=self.open_raknet_debugger)
+        self.debug_btn.pack(side="left", padx=2)
 
         # Filters
         ttk.Label(action_frame, text="| Filters:").pack(side="left", padx=5)
@@ -1268,6 +1278,10 @@ class BZLobbyMonitor:
             self.log(f"Connecting to {url}...")
             self.status_var.set("Connecting...")
             self.ws_thread = threading.Thread(target=self.run_ws, args=(url,))
+        elif host.startswith("http"):
+            self.log(f"Starting BZCC HTTP Monitor on {host}...")
+            self.status_var.set("Monitoring (HTTP)...")
+            self.ws_thread = threading.Thread(target=self.run_bzcc_http, args=(host,))
         else:
             self.log(f"Starting RakNet Monitor on {host}...")
             self.status_var.set("Monitoring (UDP)...")
@@ -1285,6 +1299,190 @@ class BZLobbyMonitor:
         self.status_var.set("Disconnected")
         self.log("Disconnected.")
 
+    def open_raknet_debugger(self):
+        win = tk.Toplevel(self.root)
+        win.title("RakNet Packet Debugger")
+        win.geometry("600x400")
+        
+        # Controls
+        ctrl = ttk.Frame(win, padding=10)
+        ctrl.pack(fill="x")
+        
+        ttk.Label(ctrl, text="Host:").pack(side="left")
+        host_val = self.host_var.get()
+        if "http" in host_val: host_val = "battlezone99mp.webdev.rebellion.co.uk:61111"
+        host_ent = ttk.Entry(ctrl, width=30)
+        host_ent.insert(0, host_val)
+        host_ent.pack(side="left", padx=5)
+        
+        ttk.Label(ctrl, text="Hex Payload:").pack(side="left")
+        payload_ent = ttk.Entry(ctrl, width=30)
+        payload_ent.insert(0, "01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00") # Default Ping
+        payload_ent.pack(side="left", padx=5)
+        
+        # Log
+        log_area = tk.Text(win, bg="#000", fg="#0f0", font=("Consolas", 9))
+        log_area.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        def clean_payload(p_str):
+            # Remove whitespace/newlines
+            clean = re.sub(r'[^0-9a-fA-F]', '', p_str)
+            
+            # Heuristic: Detect UDP Header targeting port 61111 (0xeeb7)
+            # If user pasted full Wireshark dump, look for the destination port
+            if len(clean) > 60 and "eeb7" in clean.lower():
+                idx = clean.lower().find("eeb7")
+                # UDP Header: Src(2) Dst(2) Len(2) Sum(2) -> Payload
+                # 'eeb7' is Dst(2). Payload starts 4 bytes (8 chars) after it.
+                payload_idx = idx + 8
+                if payload_idx < len(clean):
+                    extracted = clean[payload_idx:]
+                    log_area.insert("end", f"Auto-Stripped Headers. Payload: {len(extracted)//2} bytes\n")
+                    return extracted
+            return clean
+
+        def send_packet():
+            h_str = host_ent.get()
+            p_str = clean_payload(payload_ent.get())
+            
+            host, port = h_str.split(":") if ":" in h_str else (h_str, 61111)
+            try:
+                port = int(port)
+                payload = bytes.fromhex(p_str)
+                
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.settimeout(3.0)
+                
+                log_area.insert("end", f"TX -> {host}:{port} | {p_str}\n")
+                sock.sendto(payload, (host, port))
+                
+                try:
+                    data, addr = sock.recvfrom(4096)
+                    log_area.insert("end", f"RX <- {addr} | {data.hex()}\n")
+                    log_area.insert("end", f"ASCII: {data.decode('utf-8', 'ignore')}\n")
+                    log_area.insert("end", "-"*40 + "\n")
+                except socket.timeout:
+                    log_area.insert("end", "Timed out (No Reply)\n")
+                finally:
+                    sock.close()
+            except Exception as e:
+                log_area.insert("end", f"Error: {e}\n")
+                
+        def set_query():
+            p_str = clean_payload(payload_ent.get())
+            try:
+                raw = bytes.fromhex(p_str)
+                self.tx_rel_seq = (self.tx_rel_seq + 1) & 0xFFFFFF
+                self.raknet_query = self.patch_raknet_packet(raw, self.tx_rel_seq)
+                log_area.insert("end", f"Query Set (RelSeq: {self.tx_rel_seq})\n")
+            except:
+                log_area.insert("end", "Invalid Hex\n")
+
+        def load_connect():
+            # 0x09 Connection Request
+            preset = "8400000040009000000009040000001384b9fa00000000000503e100"
+            payload_ent.delete(0, "end")
+            payload_ent.insert(0, preset)
+            log_area.insert("end", "Loaded 'Connect (0x09)'\n")
+
+        def load_login():
+            # 0x13 New Incoming Connection (Generic)
+            preset = "840000006002f00000000000000013047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a0000000000000000"
+            payload_ent.delete(0, "end")
+            payload_ent.insert(0, preset)
+            log_area.insert("end", "Loaded 'Login (0x13)'\n")
+
+        def load_query():
+            # 0x60 Game Query
+            preset = "8400000040001900000060e41f80"
+            payload_ent.delete(0, "end")
+            payload_ent.insert(0, preset)
+            log_area.insert("end", "Loaded 'Query (0x60)'\n")
+
+        ttk.Button(ctrl, text="Send", command=send_packet).pack(side="left", padx=5)
+        ttk.Button(ctrl, text="0x09", width=5, command=load_connect).pack(side="left", padx=2)
+        ttk.Button(ctrl, text="0x13", width=5, command=load_login).pack(side="left", padx=2)
+        ttk.Button(ctrl, text="0x60", width=5, command=load_query).pack(side="left", padx=2)
+        ttk.Button(ctrl, text="Set as Monitor Query", command=set_query).pack(side="left", padx=5)
+
+    def register_direct_lobby(self, addr, status="Online"):
+        lid = f"direct_{addr[0]}_{addr[1]}"
+        self.lobbies[lid] = {
+            "id": lid,
+            "metadata": {
+                "name": f"Direct: {addr[0]}", 
+                "gameType": "BZCC (RakNet)", 
+                "map": status,
+                "gameSettings": "*Unknown*"
+            },
+            "users": {},
+            "memberLimit": 0,
+            "isLocked": False,
+            "isPrivate": False,
+            "owner": "Unknown"
+        }
+        self.root.after(0, self.refresh_tree)
+
+    def parse_raknet_frames(self, data):
+        try:
+            frames = []
+            offset = 4 # Skip ID(1) + Seq(3)
+            while offset < len(data):
+                flags = data[offset]
+                offset += 1
+                reliability = (flags >> 5) & 0x07
+                is_split = (flags & 0x10) != 0
+                
+                if offset + 2 > len(data): break
+                length_bits = (data[offset] << 8) | data[offset+1]
+                offset += 2
+                length_bytes = (length_bits + 7) // 8
+                
+                if reliability in [2, 3, 4]: offset += 3 # Reliable Message Number
+                if reliability in [1, 4]: offset += 4 # Sequencing Index (3) + Order Channel (1)
+                if reliability == 3: offset += 4 # Ordering Index (3) + Order Channel (1)
+                if is_split: offset += 10
+                
+                if offset + length_bytes > len(data): break
+                frames.append(data[offset : offset+length_bytes])
+                offset += length_bytes
+            return frames
+        except: return []
+
+    def patch_raknet_packet(self, pkt, new_rel_seq=None):
+        if len(pkt) < 10: return pkt
+        
+        # 1. Parse Header to find Body Offset
+        flags = pkt[4]
+        reliability = (flags >> 5) & 0x07
+        is_split = (flags & 0x10) != 0
+        
+        header_len = 7 # ID(1)+Seq(3)+Flags(1)+Len(2)
+        has_rel_seq = reliability in [2, 3, 4]
+        
+        if has_rel_seq:
+            if new_rel_seq is not None:
+                # Patch Reliable Sequence Number (Bytes 7,8,9)
+                rel_bytes = new_rel_seq.to_bytes(3, 'little')
+                pkt = pkt[:7] + rel_bytes + pkt[10:]
+            header_len += 3
+            
+        if reliability in [1, 4]: header_len += 4
+        if reliability == 3: header_len += 4
+        if is_split: header_len += 10
+            
+        if len(pkt) <= header_len: return pkt
+        
+        # 2. Patch GUID only for Connection Request (0x09)
+        msg_id = pkt[header_len]
+        if msg_id == 0x09:
+            # 0x09 Structure: ID(1) + GUID(8) + Time(8) + Sec(1)
+            guid_offset = header_len + 1
+            if len(pkt) >= guid_offset + 8:
+                pkt = pkt[:guid_offset] + self.client_guid + pkt[guid_offset+8:]
+                
+        return pkt
+
     def run_raknet(self, host_str):
         host, port = host_str.split(":") if ":" in host_str else (host_str, 61111)
         try:
@@ -1299,25 +1497,161 @@ class BZLobbyMonitor:
         sock.settimeout(2.0)
         
         # RakNet Unconnected Ping Structure:
-        # ID (0x01) + Time (8 bytes) + Magic (16 bytes) + GUID (8 bytes)
         magic = b'\x00\xff\xff\x00\xfe\xfe\xfe\xfe\xfd\xfd\xfd\xfd\x12\x34\x56\x78'
+        # Generate a persistent GUID for this session
+        self.client_guid = random.getrandbits(64).to_bytes(8, 'big')
+        
+        def make_ping(ptype):
+            current_time = int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF
+            return ptype + current_time.to_bytes(8, 'big') + magic + self.client_guid
+
+        def make_ocr1():
+            # Open Connection Request 1 (0x05)
+            # ID(1) + Magic(16) + Protocol(1) + Padding(1446) = 1464 bytes
+            return b'\x05' + magic + b'\x06' + (b'\x00' * 1446)
+
+        def make_ocr2(server_addr_bytes, mtu):
+            # Open Connection Request 2 (0x07)
+            # ID(1) + Magic(16) + ServerAddress(7) + MTU(2) + ClientGUID(8)
+            return b'\x07' + magic + server_addr_bytes + mtu + self.client_guid
+
+        pkt_mode = 0 # 0:0x01, 1:0x02, 2:0x05, 3:0x07, 4:Connected
+        server_mtu = b'\x05\xd4' # Default 1492
+        last_send_time = 0
+        self.tx_seq = 0
+        self.tx_rel_seq = -1
+        query_log_counter = 0
+        
+        # Packet Templates (Raw)
+        pkt_connect = bytes.fromhex("8400000040009000000009040000001384b9fa00000000000503e100")
+        pkt_login = bytes.fromhex("840000006002f00000000000000013047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a0000000000000000")
+        pkt_query = bytes.fromhex("8400000040001900000060e41f80")
+        
+        # Pre-calculate server address bytes for OCR2 (IPv4)
+        try:
+            ip_bytes = socket.inet_aton(socket.gethostbyname(host))
+            port_bytes = port.to_bytes(2, 'big')
+            server_addr_bytes = b'\x04' + ip_bytes + port_bytes
+        except:
+            server_addr_bytes = b'\x04\x7f\x00\x00\x01' + port.to_bytes(2, 'big')
         
         while self.should_run:
             try:
-                current_time = int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF
-                ping_pkt = b'\x01' + current_time.to_bytes(8, 'big') + magic + b'\x00'*8
-                
-                sock.sendto(ping_pkt, (host, port))
+                # Rate limit sending to avoid flooding
+                if time.time() - last_send_time > 1.0:
+                    pkt = None
+                    
+                    if pkt_mode == 0: pkt = make_ping(b'\x01')
+                    elif pkt_mode == 1: pkt = make_ping(b'\x02')
+                    elif pkt_mode == 2: pkt = make_ocr1()
+                    elif pkt_mode == 3: pkt = make_ocr2(server_addr_bytes, server_mtu)
+                    
+                    elif pkt_mode == 4: # Send Connect (0x09)
+                        self.tx_rel_seq = (self.tx_rel_seq + 1) & 0xFFFFFF
+                        pkt = self.patch_raknet_packet(pkt_connect, self.tx_rel_seq)
+                        self.log("Sending Connect (0x09)...")
+                        
+                    elif pkt_mode == 5: # Send Login (0x13)
+                        self.tx_rel_seq = (self.tx_rel_seq + 1) & 0xFFFFFF
+                        pkt = self.patch_raknet_packet(pkt_login, self.tx_rel_seq)
+                        self.log("Sending Login (0x13)...")
+                        pkt_mode = 6 # Advance to query immediately
+                        
+                    elif pkt_mode == 6: # Send Query (0x60)
+                        self.tx_rel_seq = (self.tx_rel_seq + 1) & 0xFFFFFF
+                        base = self.raknet_query if self.raknet_query else pkt_query
+                        pkt = self.patch_raknet_packet(base, self.tx_rel_seq)
+                        self.log("Sending Query (0x60)...")
+                        pkt_mode = 7 # Wait/Idle
+                        
+                    elif pkt_mode == 7: # Idle / Refresh
+                        if time.time() - last_send_time > 15.0:
+                            pkt_mode = 6 # Re-query
+                            continue
+                        else:
+                            pkt = make_ping(b'\x01') # Keep-alive
+
+                    if pkt:
+                        # Patch Packet Sequence Number (Bytes 1-3 Little Endian)
+                        if 0x80 <= pkt[0] <= 0x8F:
+                            seq_bytes = self.tx_seq.to_bytes(3, 'little')
+                            pkt = pkt[0:1] + seq_bytes + pkt[4:]
+                            self.tx_seq = (self.tx_seq + 1) & 0xFFFFFF
+                        
+                        sock.sendto(pkt, (host, port))
+                        
+                    last_send_time = time.time()
                 
                 try:
                     data, addr = sock.recvfrom(4096)
-                    # 0x1C is Unconnected Pong
-                    if data and data[0] == 0x1C:
-                        # Pong Data starts at offset 33 (1+8+8+16)
-                        server_info = data[33:].decode('utf-8', errors='ignore')
-                        self.log(f"RakNet Pong from {addr}: {server_info}")
-                    else:
-                        self.log(f"RX {len(data)}b from {addr}")
+                    if data:
+                        pid = data[0]
+                        
+                        if pid == 0x1C: # Unconnected Pong
+                            if len(data) > 33:
+                                payload = data[33:]
+                                server_info = payload.decode('utf-8', errors='ignore')
+                                self.log(f"RakNet Pong from {addr}: {server_info}")
+                            else:
+                                self.log(f"RakNet Pong (No Data) from {addr}")
+                                if pkt_mode < 2:
+                                    pkt_mode += 1
+                                    self.log(f"Switching to mode {pkt_mode}...")
+                            
+                            self.register_direct_lobby(addr, "Ping OK")
+                            
+                        elif pid == 0x06: # Open Connection Reply 1
+                            # ID(1) + Magic(16) + ServerGUID(8) + Sec(1) + MTU(2)
+                            if len(data) >= 28:
+                                server_mtu = data[26:28]
+                                if pkt_mode < 3:
+                                    pkt_mode = 3
+                                    self.log(f"RX Reply 1. MTU: {int.from_bytes(server_mtu, 'big')}. Sending OCR2...")
+                            
+                            self.register_direct_lobby(addr, "Handshake (1/2)")
+
+                        elif pid == 0x08: # Open Connection Reply 2
+                            self.log(f"RX Open Connection Reply 2 from {addr}. Connection Established!")
+                            self.register_direct_lobby(addr, "Connected")
+                            if pkt_mode < 4:
+                                pkt_mode = 4
+                                self.log("Handshake Complete. Switching to Connected Mode (4).")
+                            
+                        elif 0x80 <= pid <= 0x8F: # RakNet Frame Set (Data)
+                            # 1. Extract Sequence Number (Bytes 1-3 Little Endian)
+                            seq_bytes = data[1:4]
+                            seq_num = int.from_bytes(seq_bytes, 'little')
+                            
+                            # 2. Send ACK (0xC0)
+                            # Structure: ID(C0) + Count(00 01) + Equal(01) + Seq(3 bytes)
+                            ack_pkt = b'\xC0\x00\x01\x01' + seq_bytes
+                            sock.sendto(ack_pkt, (host, port))
+                            
+                            self.log(f"RX FrameSet {len(data)}b (ID: {hex(pid)}) Seq: {seq_num} -> Sent ACK")
+                            
+                            frames = self.parse_raknet_frames(data)
+                            for i, frame in enumerate(frames):
+                                if not frame: continue
+                                msg_id = frame[0]
+                                # self.log(f"  Msg {i}: ID {hex(msg_id)} ({len(frame)}b)")
+                                
+                                if msg_id == 0x10:
+                                    self.log("  -> Connection Request Accepted")
+                                    if pkt_mode == 4:
+                                        pkt_mode = 5 # Proceed to Login
+                                elif msg_id == 0x61:
+                                    self.log("  -> Game List Response (0x61)")
+                                    payload = frame[1:]
+                                    if len(payload) >= 4:
+                                        count = int.from_bytes(payload[:4], 'little')
+                                        self.log(f"  -> Lobby Count: {count}")
+                                        if len(payload) > 4:
+                                            self.log(f"  -> Raw Data: {payload[4:].hex()}")
+                                    else:
+                                        self.log(f"  -> Data ({len(payload)}b): {payload.hex()}")
+                        
+                        else:
+                            self.log(f"RX {len(data)}b from {addr} (ID: {hex(pid)})")
                 except socket.timeout:
                     pass
                 
@@ -1336,6 +1670,73 @@ class BZLobbyMonitor:
             delay = self.config.get("reconnect_delay", 10)
             self.log(f"Auto-reconnecting in {delay}s...")
             self.root.after(delay * 1000, self.connect)
+
+    def run_bzcc_http(self, url):
+        self.connected = True
+        
+        while self.should_run:
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'BZLobbyMonitor/1.0'})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    data = json.loads(r.read().decode('utf-8'))
+                    self.process_bzcc_data(data)
+            except Exception as e:
+                self.log(f"HTTP Error: {e}")
+            
+            for _ in range(15): # Poll every 15s
+                if not self.should_run: break
+                time.sleep(1)
+        
+        self.connected = False
+        self.root.after(0, lambda: self.status_var.set("Disconnected"))
+        self.root.after(0, lambda: self.connect_btn.config(text="Connect"))
+        self.log("BZCC Monitor Stopped.")
+
+    def process_bzcc_data(self, data):
+        # Map BZCC JSON (Model.cs) to internal lobby structure
+        games = data.get("GET", [])
+        new_lobbies = {}
+        
+        for g in games:
+            lid = g.get("g") # GUID
+            if not lid: continue
+            
+            # Decode Name (Base64)
+            raw_name = g.get("n") or ""
+            try:
+                name = base64.b64decode(raw_name).decode('cp1252', errors='ignore').rstrip('\x00')
+            except:
+                name = raw_name
+                
+            map_name = g.get("m", "Unknown")
+            
+            users = {}
+            players = g.get("pl") or []
+            for p in players:
+                pid = p.get("i", "Unknown")
+                p_raw = p.get("n") or ""
+                try:
+                    p_name = base64.b64decode(p_raw).decode('cp1252', errors='ignore').rstrip('\x00')
+                except:
+                    p_name = p_raw
+                users[pid] = {"name": p_name, "id": pid, "team": p.get("t"), "score": p.get("s")}
+            
+            lobby = {
+                "id": lid,
+                "metadata": {
+                    "name": name, "gameType": "BZCC", "map": map_name, 
+                    "gameSettings": f"*{map_name}*", "ready": f"*{map_name}*"
+                },
+                "users": users,
+                "memberLimit": g.get("pm", 0),
+                "isLocked": str(g.get("l")) == "1",
+                "isPrivate": str(g.get("k")) == "1",
+                "owner": users[next(iter(users))]["id"] if users else "Unknown"
+            }
+            new_lobbies[str(lid)] = lobby
+            
+        self.lobbies = new_lobbies
+        self.root.after(0, self.refresh_tree)
 
     def run_ws(self, url):
         # websocket.enableTrace(True)
@@ -2001,7 +2402,8 @@ class BZLobbyMonitor:
     def download_tor(self, target_dir):
         self.log("Downloading Tor Expert Bundle...")
         # URL for Tor Expert Bundle Windows x86_64 (Stable)
-        url = "https://archive.torproject.org/tor-package-archive/torbrowser/14.0.4/tor-expert-bundle-14.0.4-windows-x86_64.tar.gz"
+        url = "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.5/tor-expert-bundle-windows-x86_64-15.0.5.tar.gz"
+        self.log(f"URL: {url}")
         
         try:
             if not os.path.exists(target_dir):
@@ -2026,7 +2428,7 @@ class BZLobbyMonitor:
             if not os.path.exists(data_dir): os.makedirs(data_dir)
             
             with open(torrc_path, "w") as f:
-                f.write(f"SocksPort 9050\nDataDirectory {data_dir}\n")
+                f.write(f"SocksPort 9050\nDataDirectory {os.path.abspath(data_dir)}\n")
                 
             self.log("Tor installed successfully.")
         except Exception as e:
@@ -2086,7 +2488,7 @@ class BZLobbyMonitor:
             for proxy in proxies[:10]: # Try up to 10
                 host, port = proxy.split(':')
                 self.log(f"Testing proxy {host}:{port}...")
-                if self._test_proxy_connection(host, port):
+                if self._test_proxy_connection(host, port, ptype="http"):
                     self.root.after(0, lambda h=host, p=port: self._set_proxy_ui(h, p))
                     self.log(f"Found working proxy: {host}:{port}")
                     return
@@ -2095,13 +2497,27 @@ class BZLobbyMonitor:
         except Exception as e:
             self.log(f"Proxy search failed: {e}")
 
-    def _test_proxy_connection(self, host, port):
+    def _test_proxy_connection(self, host, port, ptype=None):
+        if ptype is None:
+            ptype = self.config.get("proxy_type", "http")
+            
         try:
-            # Try to connect to a reliable site via the proxy
-            proxy_handler = urllib.request.ProxyHandler({'http': f"{host}:{port}", 'https': f"{host}:{port}"})
-            opener = urllib.request.build_opener(proxy_handler)
-            opener.open("http://www.google.com", timeout=5)
-            return True
+            if ptype == "socks5":
+                try:
+                    import socks
+                    s = socks.socksocket()
+                    s.set_proxy(socks.SOCKS5, host, int(port))
+                    s.settimeout(5)
+                    s.connect(("www.google.com", 80))
+                    s.close()
+                    return True
+                except:
+                    return False
+            else:
+                proxy_handler = urllib.request.ProxyHandler({'http': f"{host}:{port}", 'https': f"{host}:{port}"})
+                opener = urllib.request.build_opener(proxy_handler)
+                opener.open("http://www.google.com", timeout=5)
+                return True
         except:
             return False
 
@@ -2131,6 +2547,7 @@ class BZLobbyMonitor:
                     body = response.split(b"\r\n\r\n")[1].decode('utf-8')
                     self.log(f"Proxy Test (SOCKS5): SUCCESS. IP: {body}")
                     success = True
+                    self.root.after(0, lambda: messagebox.showinfo("Proxy Verified", f"SOCKS5 Proxy is working.\nExternal IP: {body}"))
                 elif self._test_proxy_connection(host, port):
                     # For HTTP, try to get IP as well
                     req = urllib.request.Request("http://api.ipify.org")
@@ -2138,6 +2555,7 @@ class BZLobbyMonitor:
                     with urllib.request.urlopen(req, timeout=10) as r:
                         ip = r.read().decode('utf-8')
                         self.log(f"Proxy Test (HTTP): SUCCESS. IP: {ip}")
+                        self.root.after(0, lambda: messagebox.showinfo("Proxy Verified", f"HTTP Proxy is working.\nExternal IP: {ip}"))
                     success = True
             except Exception as e:
                 self.log(f"Proxy Test Failed: {e}")
