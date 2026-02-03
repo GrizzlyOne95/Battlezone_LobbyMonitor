@@ -1481,6 +1481,13 @@ class BZLobbyMonitor:
             if len(pkt) >= guid_offset + 8:
                 pkt = pkt[:guid_offset] + self.client_guid + pkt[guid_offset+8:]
                 
+        # 3. Patch Server Address for Login (0x13)
+        if msg_id == 0x13 and hasattr(self, 'server_addr_bytes'):
+            # 0x13 Structure: ID(1) + ServerAddr(7) + ...
+            addr_offset = header_len + 1
+            if len(pkt) >= addr_offset + 7:
+                pkt = pkt[:addr_offset] + self.server_addr_bytes + pkt[addr_offset+7:]
+                
         return pkt
 
     def run_raknet(self, host_str):
@@ -1524,17 +1531,17 @@ class BZLobbyMonitor:
         
         # Packet Templates (Raw)
         pkt_connect = bytes.fromhex("8400000040009000000009040000001384b9fa00000000000503e100")
-        pkt_login = bytes.fromhex("840000006002f00000000000000013047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a047f000001456a0000000000000000")
         pkt_query = bytes.fromhex("8400000040001900000060e41f80")
         
         # Pre-calculate server address bytes for OCR2 (IPv4)
         try:
             ip_bytes = socket.inet_aton(socket.gethostbyname(host))
             port_bytes = port.to_bytes(2, 'big')
-            server_addr_bytes = b'\x04' + ip_bytes + port_bytes
+            self.server_addr_bytes = b'\x04' + ip_bytes + port_bytes
         except:
-            server_addr_bytes = b'\x04\x7f\x00\x00\x01' + port.to_bytes(2, 'big')
+            self.server_addr_bytes = b'\x04\x7f\x00\x00\x01' + port.to_bytes(2, 'big')
         
+        last_http_poll = 0
         while self.should_run:
             try:
                 # Rate limit sending to avoid flooding
@@ -1544,7 +1551,7 @@ class BZLobbyMonitor:
                     if pkt_mode == 0: pkt = make_ping(b'\x01')
                     elif pkt_mode == 1: pkt = make_ping(b'\x02')
                     elif pkt_mode == 2: pkt = make_ocr1()
-                    elif pkt_mode == 3: pkt = make_ocr2(server_addr_bytes, server_mtu)
+                    elif pkt_mode == 3: pkt = make_ocr2(self.server_addr_bytes, server_mtu)
                     
                     elif pkt_mode == 4: # Send Connect (0x09)
                         self.tx_rel_seq = (self.tx_rel_seq + 1) & 0xFFFFFF
@@ -1553,7 +1560,7 @@ class BZLobbyMonitor:
                         
                     elif pkt_mode == 5: # Send Login (0x13)
                         self.tx_rel_seq = (self.tx_rel_seq + 1) & 0xFFFFFF
-                        pkt = self.patch_raknet_packet(pkt_login, self.tx_rel_seq)
+                        pkt = self.make_login_packet(self.server_addr_bytes, port, self.tx_rel_seq)
                         self.log("Sending Login (0x13)...")
                         pkt_mode = 6 # Advance to query immediately
                         
@@ -1563,13 +1570,20 @@ class BZLobbyMonitor:
                         pkt = self.patch_raknet_packet(base, self.tx_rel_seq)
                         self.log("Sending Query (0x60)...")
                         pkt_mode = 7 # Wait/Idle
+                        self.poll_http_lobby()
                         
                     elif pkt_mode == 7: # Idle / Refresh
-                        if time.time() - last_send_time > 15.0:
+                        if time.time() - last_send_time > 10.0:
                             pkt_mode = 6 # Re-query
+                            # Also poll HTTP occasionally
+                            self.poll_http_lobby()
                             continue
                         else:
-                            pkt = make_ping(b'\x01') # Keep-alive
+                            # Connected Ping (0x00) in Frame (0x84)
+                            # Header: 84 + Seq(3) + Flags(00) + Len(0048) + ID(00) + Time(8)
+                            pkt = bytearray.fromhex("84000000000048000000000000000000")
+                            t_ms = int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF
+                            pkt[8:] = t_ms.to_bytes(8, 'big')
 
                     if pkt:
                         # Patch Packet Sequence Number (Bytes 1-3 Little Endian)
@@ -1627,9 +1641,12 @@ class BZLobbyMonitor:
                             ack_pkt = b'\xC0\x00\x01\x01' + seq_bytes
                             sock.sendto(ack_pkt, (host, port))
                             
-                            self.log(f"RX FrameSet {len(data)}b (ID: {hex(pid)}) Seq: {seq_num} -> Sent ACK")
-                            
                             frames = self.parse_raknet_frames(data)
+                            # Only log if not just a Ping/Pong
+                            is_ping_pong = all(f and f[0] in [0x00, 0x03] for f in frames)
+                            if not is_ping_pong:
+                                self.log(f"RX FrameSet {len(data)}b (ID: {hex(pid)}) Seq: {seq_num} -> Sent ACK")
+
                             for i, frame in enumerate(frames):
                                 if not frame: continue
                                 msg_id = frame[0]
@@ -1642,13 +1659,12 @@ class BZLobbyMonitor:
                                 elif msg_id == 0x61:
                                     self.log("  -> Game List Response (0x61)")
                                     payload = frame[1:]
+                                    self.log(f"  -> Raw Data: {payload.hex()}")
                                     if len(payload) >= 4:
                                         count = int.from_bytes(payload[:4], 'little')
                                         self.log(f"  -> Lobby Count: {count}")
-                                        if len(payload) > 4:
-                                            self.log(f"  -> Raw Data: {payload[4:].hex()}")
-                                    else:
-                                        self.log(f"  -> Data ({len(payload)}b): {payload.hex()}")
+                                        if count > 0:
+                                            self.poll_http_lobby()
                         
                         else:
                             self.log(f"RX {len(data)}b from {addr} (ID: {hex(pid)})")
@@ -2233,7 +2249,6 @@ class BZLobbyMonitor:
             if user_name == 'unknown' or not user_name:
                 user_name = user_meta.get('name', 'Unknown')
                 
-            self.player_details_text.insert("end", f" - {user_name} (ID: {uid})\n")
             is_friend = any(f.strip() in user_name.lower() or f.strip() in str(uid).lower() for f in friends if f.strip())
             
             self.player_details_text.insert("end", f" - {user_name} (ID: {uid})", "friend" if is_friend else "")
@@ -2974,6 +2989,66 @@ class BZLobbyMonitor:
         self.stats_canvas.create_text(w-pad, h-pad+15, text=sorted_pts[-1][0].strftime("%H:%M"), fill="gray", anchor="e")
         self.stats_canvas.create_text(pad-5, pad, text=str(max_p), fill="gray", anchor="e")
         self.stats_canvas.create_text(pad-5, h-pad, text="0", fill="gray", anchor="e")
+
+    def make_login_packet(self, server_addr_bytes, port, rel_seq):
+        # Construct 0x13 Message
+        msg = bytearray()
+        msg.append(0x13)
+        
+        # Server Address (Inverted IP for BZCC RakNet)
+        srv_ip = server_addr_bytes[1:5]
+        inv_srv_ip = bytes([b ^ 0xFF for b in srv_ip])
+        msg.extend(b'\x04' + inv_srv_ip + server_addr_bytes[5:])
+        
+        # Internal IPs (List of 10)
+        local_ips = []
+        try:
+            # Get actual local IPs to satisfy server validation
+            local_ips = [ip for ip in socket.gethostbyname_ex(socket.gethostname())[2] if not ip.startswith("127.")]
+        except: pass
+        if not local_ips: local_ips = ["0.0.0.0"]
+        
+        for i in range(10):
+            msg.append(0x04) # Family AF_INET
+            if i < len(local_ips):
+                try:
+                    ip_bytes = socket.inet_aton(local_ips[i])
+                    msg.extend(bytes([b ^ 0xFF for b in ip_bytes]))
+                except:
+                    msg.extend(b'\xff'*4)
+            else:
+                msg.extend(b'\xff'*4)
+            msg.extend(port.to_bytes(2, 'big'))
+            
+        msg.extend((0).to_bytes(16, 'big')) # Timestamps
+        
+        # Wrap in RakNet Frame (Reliable Ordered)
+        # Header: ID(1) + Seq(3) + Flags(1) + Len(2) + RelSeq(3) + OrderIndex(3) + OrderChannel(1)
+        frame = bytearray()
+        frame.append(0x84)
+        frame.extend((0).to_bytes(3, 'little')) # Seq (patched later)
+        frame.append(0x60) # Reliability 3 (Reliable Ordered)
+        frame.extend((len(msg) * 8).to_bytes(2, 'big')) # Length in bits
+        frame.extend(rel_seq.to_bytes(3, 'little'))
+        frame.extend((0).to_bytes(3, 'little')) # Order Index
+        frame.append(0) # Order Channel
+        frame.extend(msg)
+        
+        return bytes(frame)
+
+    def poll_http_lobby(self):
+        try:
+            url = "http://battlezone99mp.webdev.rebellion.co.uk/lobbyServer/"
+            req = urllib.request.Request(url, method="GET")
+            
+            with urllib.request.urlopen(req, timeout=5) as f:
+                res = json.load(f)
+                if "GET" in res:
+                    games = res["GET"]
+                    self.log(f"HTTP Lobby: Found {len(games)} games.")
+                    self.process_bzcc_data(res)
+        except Exception as e:
+            self.log(f"HTTP Poll Failed: {e}")
 
 if __name__ == "__main__":
     root = tk.Tk()
