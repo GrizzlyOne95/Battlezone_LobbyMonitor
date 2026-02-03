@@ -92,6 +92,7 @@ class BZLobbyMonitor:
         self.geo_cache = {}
         self.rpc = None
         self.last_announce_time = time.time()
+        self.last_event_announce_time = 0
         self.last_welcome_times = {}
         self.last_claim_attempt = 0
         self.tray_icon = None
@@ -164,6 +165,11 @@ class BZLobbyMonitor:
             "bot_announce_enabled": False,
             "bot_announce_msg": "Join our Discord!",
             "bot_announce_interval": 5,
+            "bot_event_enabled": False,
+            "bot_event_msg": "",
+            "bot_event_start": "",
+            "bot_event_end": "",
+            "bot_event_interval": 10,
             "auto_claim_enabled": False,
             "auto_claim_name": "default",
             "auto_claim_bot_name": "",
@@ -688,6 +694,32 @@ class BZLobbyMonitor:
         self.bot_announce_int_var = tk.IntVar(value=self.config.get("bot_announce_interval", 5))
         ttk.Spinbox(ann_frame, from_=1, to=120, textvariable=self.bot_announce_int_var, width=5).pack(anchor="w", pady=2)
         
+        # Timed Events
+        event_frame = ttk.LabelFrame(container, text="Timed Event Messages", padding=10)
+        event_frame.pack(fill="x", pady=5)
+
+        self.bot_event_enabled_var = tk.BooleanVar(value=self.config.get("bot_event_enabled", False))
+        ttk.Checkbutton(event_frame, text="Enable Event Messages", variable=self.bot_event_enabled_var, command=self.save_ui_config).pack(anchor="w")
+
+        ttk.Label(event_frame, text="Message:").pack(anchor="w", pady=(5,0))
+        self.bot_event_msg_var = tk.StringVar(value=self.config.get("bot_event_msg", ""))
+        ttk.Entry(event_frame, textvariable=self.bot_event_msg_var, width=60).pack(fill="x", pady=2)
+
+        date_frame = ttk.Frame(event_frame)
+        date_frame.pack(fill="x", pady=2)
+        
+        ttk.Label(date_frame, text="Start (YYYY-MM-DD HH:MM):").pack(side="left")
+        self.bot_event_start_var = tk.StringVar(value=self.config.get("bot_event_start", ""))
+        ttk.Entry(date_frame, textvariable=self.bot_event_start_var, width=18).pack(side="left", padx=5)
+
+        ttk.Label(date_frame, text="End:").pack(side="left")
+        self.bot_event_end_var = tk.StringVar(value=self.config.get("bot_event_end", ""))
+        ttk.Entry(date_frame, textvariable=self.bot_event_end_var, width=18).pack(side="left", padx=5)
+
+        ttk.Label(date_frame, text="Int (m):").pack(side="left")
+        self.bot_event_int_var = tk.IntVar(value=self.config.get("bot_event_interval", 10))
+        ttk.Spinbox(date_frame, from_=1, to=1440, textvariable=self.bot_event_int_var, width=5).pack(side="left", padx=5)
+
         # Auto-Claim
         claim_frame = ttk.LabelFrame(container, text="Auto-Claim Lobby", padding=10)
         claim_frame.pack(fill="x", pady=5)
@@ -812,6 +844,11 @@ class BZLobbyMonitor:
         self.config["bot_announce_enabled"] = self.bot_announce_enabled_var.get()
         self.config["bot_announce_msg"] = self.bot_announce_msg_var.get()
         self.config["bot_announce_interval"] = self.bot_announce_int_var.get()
+        self.config["bot_event_enabled"] = self.bot_event_enabled_var.get()
+        self.config["bot_event_msg"] = self.bot_event_msg_var.get()
+        self.config["bot_event_start"] = self.bot_event_start_var.get()
+        self.config["bot_event_end"] = self.bot_event_end_var.get()
+        self.config["bot_event_interval"] = self.bot_event_int_var.get()
         self.config["auto_claim_enabled"] = self.auto_claim_enabled_var.get()
         self.config["auto_claim_name"] = self.auto_claim_name_var.get()
         self.config["auto_claim_bot_name"] = self.auto_claim_bot_name_var.get()
@@ -2865,13 +2902,39 @@ class BZLobbyMonitor:
 
     def bot_loop(self):
         while self.should_run:
-            if self.config.get("bot_announce_enabled", False) and self.connected and self.current_lobby_id is not None:
-                interval = self.config.get("bot_announce_interval", 5) * 60
-                if time.time() - self.last_announce_time > interval:
-                    msg = self.config.get("bot_announce_msg", "")
-                    if msg:
-                        self.send_chat_message(msg)
-                        self.last_announce_time = time.time()
+            if self.connected and self.current_lobby_id is not None:
+                # Standard Announcements
+                if self.config.get("bot_announce_enabled", False):
+                    interval = self.config.get("bot_announce_interval", 5) * 60
+                    if time.time() - self.last_announce_time > interval:
+                        msg = self.config.get("bot_announce_msg", "")
+                        if msg:
+                            self.send_chat_message(msg)
+                            self.last_announce_time = time.time()
+                
+                # Timed Event Announcements
+                if self.config.get("bot_event_enabled", False):
+                    try:
+                        start_str = self.config.get("bot_event_start", "")
+                        end_str = self.config.get("bot_event_end", "")
+                        if start_str and end_str:
+                            now = datetime.now()
+                            fmt = "%Y-%m-%d %H:%M"
+                            start_dt = datetime.strptime(start_str, fmt)
+                            end_dt = datetime.strptime(end_str, fmt)
+                            
+                            if start_dt <= now <= end_dt:
+                                evt_interval = self.config.get("bot_event_interval", 10) * 60
+                                if time.time() - self.last_event_announce_time > evt_interval:
+                                    evt_msg = self.config.get("bot_event_msg", "")
+                                    if evt_msg:
+                                        self.send_chat_message(evt_msg)
+                                        self.last_event_announce_time = time.time()
+                    except ValueError:
+                        pass # Invalid date format
+                    except Exception as e:
+                        print(f"Event bot error: {e}")
+
             time.sleep(10)
 
     def check_auto_claim(self):
