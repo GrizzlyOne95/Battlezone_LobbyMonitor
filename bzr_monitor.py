@@ -2974,10 +2974,16 @@ class BZLobbyMonitor:
         
         def _fetch():
             try:
-                with urllib.request.urlopen(f"http://ip-api.com/json/{ip}") as r:
+                with urllib.request.urlopen(f"http://ip-api.com/json/{ip}?fields=status,countryCode,timezone,offset") as r:
                     data = json.loads(r.read().decode())
                     if data.get("status") == "success":
-                        info = f"[{data.get('countryCode')}] {data.get('timezone')}"
+                        offset = data.get('offset', 0)
+                        sign = '+' if offset >= 0 else '-'
+                        offset = abs(offset)
+                        hours = int(offset / 3600)
+                        minutes = int((offset % 3600) / 60)
+                        utc_str = f"UTC{sign}{hours}:{minutes:02d}"
+                        info = f"[{data.get('countryCode')}] {data.get('timezone')} ({utc_str})"
                         self.geo_cache[ip] = info
                         # Refresh UI if this player is currently shown
                         self.root.after(0, lambda: self.on_lobby_select(None))
