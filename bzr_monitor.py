@@ -1720,7 +1720,10 @@ class BZLobbyMonitor:
             # Decode Name (Base64)
             raw_name = g.get("n") or ""
             try:
-                name = base64.b64decode(raw_name).decode('cp1252', errors='ignore').rstrip('\x00')
+                raw_name += "=" * ((4 - len(raw_name) % 4) % 4)
+                decoded = base64.b64decode(raw_name)
+                name_bytes = decoded.split(b'\x00')[0]
+                name = name_bytes.decode('utf-8', errors='replace')
             except:
                 name = raw_name
                 
@@ -1732,7 +1735,9 @@ class BZLobbyMonitor:
                 pid = p.get("i", "Unknown")
                 p_raw = p.get("n") or ""
                 try:
-                    p_name = base64.b64decode(p_raw).decode('cp1252', errors='ignore').rstrip('\x00')
+                    p_raw += "=" * ((4 - len(p_raw) % 4) % 4)
+                    p_decoded = base64.b64decode(p_raw)
+                    p_name = p_decoded.split(b'\x00')[0].decode('utf-8', errors='replace')
                 except:
                     p_name = p_raw
                 users[pid] = {"name": p_name, "id": pid, "team": p.get("t"), "score": p.get("s")}
@@ -1740,8 +1745,15 @@ class BZLobbyMonitor:
             lobby = {
                 "id": lid,
                 "metadata": {
-                    "name": name, "gameType": "BZCC", "map": map_name, 
-                    "gameSettings": f"*{map_name}*", "ready": f"*{map_name}*"
+                    "name": name, 
+                    "gameType": "BZCC", 
+                    "map": map_name, 
+                    "gameSettings": f"*{map_name}*", 
+                    "ready": f"*{map_name}*",
+                    "version": g.get("v", "?"),
+                    "typeId": g.get("gt", 0),
+                    "stateId": g.get("si", 0),
+                    "maxPlayers": g.get("pm", 0)
                 },
                 "users": users,
                 "memberLimit": g.get("pm", 0),
@@ -2120,6 +2132,7 @@ class BZLobbyMonitor:
         # Repopulate
         friends = self.config.get("friend_list", "").lower().splitlines()
         for lid, lobby in self.lobbies.items():
+            if str(lid).startswith("direct_"): continue
             meta = lobby.get("metadata", {})
             raw_name = meta.get("name", "Unknown")
             
@@ -2215,6 +2228,25 @@ class BZLobbyMonitor:
         
         self.lobby_details_text.insert("end", f"Name: {l_meta.get('name')}\n")
         self.lobby_details_text.insert("end", f"Created: {lobby.get('createdTime')}\n")
+        
+        if l_meta.get("gameType") == "BZCC":
+            gt = l_meta.get("typeId")
+            type_map = {1: "Deathmatch", 2: "Strategy", 3: "MPI"}
+            type_str = type_map.get(gt, f"Unknown ({gt})")
+            self.lobby_details_text.insert("end", f"Type: {type_str}\n")
+            
+            si = l_meta.get("stateId")
+            state_map = {3: "Lobby", 4: "Loading", 5: "In Game", 6: "Post Game"}
+            state_str = state_map.get(si, f"Unknown ({si})")
+            self.lobby_details_text.insert("end", f"State: {state_str}\n")
+            
+            self.lobby_details_text.insert("end", f"Version: {l_meta.get('version')}\n")
+            
+            users = lobby.get("users", {})
+            max_p = l_meta.get("maxPlayers", "?")
+            self.lobby_details_text.insert("end", f"Players: {len(users)} / {max_p}\n")
+        else:
+            self.lobby_details_text.insert("end", f"Created: {lobby.get('createdTime')}\n")
         
         # Parse Game Settings from Lobby Metadata
         if game_settings:
@@ -3291,8 +3323,6 @@ if __name__ == "__main__":
                         players = int(row[4])
                         
                         # Group by minute to reduce noise
-                        key = dt.replace(second=0, microsecond=0)
-                        if key not in data_points: data_points[key] = 0
                         # Since CSV has one row per lobby, we need to sum them for the same timestamp
                         # But timestamps are exact per snapshot. 
                         # We can assume unique timestamps per snapshot.
