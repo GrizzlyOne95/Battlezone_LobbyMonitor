@@ -80,6 +80,7 @@ jobs:
             bzr_monitor.py -y
 
       - name: Verify build output
+        shell: bash
         run: |
           ls -la dist/ || echo "dist directory not found"
 
