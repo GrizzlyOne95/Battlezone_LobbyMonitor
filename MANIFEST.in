@@ -1,0 +1,4 @@
+include README.md
+include LICENSE
+include requirements.txt
+include bzr_monitor_config.json
