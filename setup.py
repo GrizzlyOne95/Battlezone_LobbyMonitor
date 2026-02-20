@@ -38,6 +38,6 @@ setup(
     },
     include_package_data=True,
     package_data={
-        "": ["bzr_monitor_config.json"],
+        "": [],
     },
 )
