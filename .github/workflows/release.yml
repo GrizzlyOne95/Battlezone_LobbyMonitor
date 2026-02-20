@@ -161,15 +161,15 @@ jobs:
           
           # Create archives for executables
           if [ -f "releases/bzr_monitor-windows-x64.exe" ]; then
-            cd releases && zip -q "bzr_monitor-v${GITHUB_REF#refs/tags/}-windows-x64.zip" "bzr_monitor-windows-x64.exe" && cd ..
+            cd releases && zip -q "bzr_monitor-${GITHUB_REF#refs/tags/}-windows-x64.zip" "bzr_monitor-windows-x64.exe" && cd ..
           fi
           
           if [ -f "releases/bzr_monitor-macos-x64" ]; then
-            cd releases && tar -czf "bzr_monitor-v${GITHUB_REF#refs/tags/}-macos-x64.tar.gz" "bzr_monitor-macos-x64" && cd ..
+            cd releases && tar -czf "bzr_monitor-${GITHUB_REF#refs/tags/}-macos-x64.tar.gz" "bzr_monitor-macos-x64" && cd ..
           fi
           
           if [ -f "releases/bzr_monitor-linux-x64" ]; then
-            cd releases && tar -czf "bzr_monitor-v${GITHUB_REF#refs/tags/}-linux-x64.tar.gz" "bzr_monitor-linux-x64" && cd ..
+            cd releases && tar -czf "bzr_monitor-${GITHUB_REF#refs/tags/}-linux-x64.tar.gz" "bzr_monitor-linux-x64" && cd ..
           fi
           
           echo "Final release artifacts:"
@@ -182,8 +182,8 @@ jobs:
             releases/bzr_monitor-v*-windows-x64.zip
             releases/bzr_monitor-v*-macos-x64.tar.gz
             releases/bzr_monitor-v*-linux-x64.tar.gz
-            releases/bzr_monitor-*.whl
-            releases/bzr_monitor-*.tar.gz
+            releases/bzr_monitor-1.0.0-py3-none-any.whl
+            releases/bzr_monitor-1.0.0.tar.gz
           draft: false
           prerelease: false
           generate_release_notes: true
