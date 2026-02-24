@@ -886,8 +886,7 @@ class BZLobbyMonitor:
                     should_alert = True
             else:
                 should_alert = True
-        elif alert_type == "griefer_join" and self.config.get("alert_griefer"): should_alert = True
-        elif alert_type == "griefer_join" and self.config.get("alert_griefer"): 
+        elif alert_type == "griefer_join" and self.config.get("alert_griefer"):
             should_alert = True
             sound_key = "sound_griefer"
         elif alert_type == "disconnect" and self.config.get("alert_disconnect"): should_alert = True
@@ -1226,15 +1225,15 @@ class BZLobbyMonitor:
             self._file_log(message)
 
     def _file_log(self, message):
-            try:
-                folder = self.config.get("log_folder", "")
-                if not folder or not os.path.exists(folder):
-                    folder = "."
-                filename = os.path.join(folder, f"bzr_log_{datetime.now().strftime('%Y-%m-%d')}.txt")
-                timestamp = datetime.now().strftime("[%H:%M:%S]")
-                with open(filename, "a", encoding="utf-8") as f:
-                    f.write(f"{timestamp} {message}\n")
-            except: pass
+        try:
+            folder = self.config.get("log_folder", "")
+            if not folder or not os.path.exists(folder):
+                folder = "."
+            filename = os.path.join(folder, f"bzr_log_{datetime.now().strftime('%Y-%m-%d')}.txt")
+            timestamp = datetime.now().strftime("[%H:%M:%S]")
+            with open(filename, "a", encoding="utf-8") as f:
+                f.write(f"{timestamp} {message}\n")
+        except: pass
 
     def toggle_connection(self):
         if self.connected:
@@ -1671,7 +1670,7 @@ class BZLobbyMonitor:
                 except socket.timeout:
                     pass
                 
-                time.sleep(5)
+                time.sleep(0.05)  # Tight loop; socket timeout (2s) provides recv pacing
             except Exception as e:
                 self.log(f"RakNet Error: {e}")
                 break
@@ -2225,7 +2224,6 @@ class BZLobbyMonitor:
                 self.fetch_image(mod_id, is_mod=True)
         
         self.lobby_details_text.insert("end", f"Lobby ID: {lobby.get('id')}\n")
-        
         self.lobby_details_text.insert("end", f"Name: {l_meta.get('name')}\n")
         self.lobby_details_text.insert("end", f"Created: {lobby.get('createdTime')}\n")
         
@@ -2245,8 +2243,6 @@ class BZLobbyMonitor:
             users = lobby.get("users", {})
             max_p = l_meta.get("maxPlayers", "?")
             self.lobby_details_text.insert("end", f"Players: {len(users)} / {max_p}\n")
-        else:
-            self.lobby_details_text.insert("end", f"Created: {lobby.get('createdTime')}\n")
         
         # Parse Game Settings from Lobby Metadata
         if game_settings:
@@ -2911,10 +2907,14 @@ class BZLobbyMonitor:
         
         def _fetch():
             try:
-                with urllib.request.urlopen(f"http://ip-api.com/json/{ip}") as r:
+                with urllib.request.urlopen(f"http://ip-api.com/json/{ip}?fields=status,countryCode,timezone,offset") as r:
                     data = json.loads(r.read().decode())
                     if data.get("status") == "success":
-                        info = f"[{data.get('countryCode')}] {data.get('timezone')}"
+                        offset = data.get('offset', 0)
+                        hours = int(offset / 3600)
+                        minutes = int((abs(offset) % 3600) / 60)
+                        utc_str = f"UTC{'+' if hours >= 0 else ''}{hours}:{minutes:02d}"
+                        info = f"[{data.get('countryCode')}] {data.get('timezone')} ({utc_str})"
                         self.geo_cache[ip] = info
                         # Refresh UI if this player is currently shown
                         self.root.after(0, lambda: self.on_lobby_select(None))
@@ -2977,18 +2977,8 @@ class BZLobbyMonitor:
                         dt = datetime.fromisoformat(ts_str)
                         # Filter last 24h
                         if datetime.now() - dt > timedelta(hours=24): continue
-                        
                         players = int(row[4])
-                        
-                        # Group by minute to reduce noise
-                        key = dt.replace(second=0, microsecond=0)
-                        if key not in data_points: data_points[key] = 0
-                        # Since CSV has one row per lobby, we need to sum them for the same timestamp
-                        # But timestamps are exact per snapshot. 
-                        # We can assume unique timestamps per snapshot.
-                        # Actually, let's just take the max players seen in a 5-min window?
-                        # Simpler: Just plot raw points.
-                        # Better: Group by snapshot. A snapshot shares the exact ISO string.
+                        # Sum players per snapshot (each snapshot = one exact ISO timestamp)
                         if ts_str not in data_points: data_points[ts_str] = 0
                         data_points[ts_str] += players
                     except: pass
@@ -3086,15 +3076,6 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = BZLobbyMonitor(root)
     root.mainloop()
-
-    # --- Discord Integration ---
-    def toggle_discord_relay(self):
-        self.save_ui_config()
-        if self.discord_enabled_var.get():
-            if not self.discord_thread or not self.discord_thread.is_alive():
-                self.discord_thread = threading.Thread(target=self.discord_polling_loop, daemon=True)
-                self.discord_thread.start()
-                self.log("Discord Relay Started.")
         
     def test_discord_connection(self):
         token = self.discord_token_var.get()
