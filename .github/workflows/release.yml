@@ -1,0 +1,191 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-exe:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os-version }}
+    strategy:
+      matrix:
+        include:
+          - os: Windows
+            os-version: windows-latest
+            artifact-name: bzr_monitor-windows-x64.exe
+            output-path: dist/bzr_monitor.exe
+          - os: macOS
+            os-version: macos-latest
+            artifact-name: bzr_monitor-macos-x64
+            output-path: dist/bzr_monitor
+          - os: Linux
+            os-version: ubuntu-latest
+            artifact-name: bzr_monitor-linux-x64
+            output-path: dist/bzr_monitor
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build executable (Windows)
+        if: matrix.os == 'Windows'
+        run: |
+          python -m PyInstaller --name bzr_monitor --onefile --windowed `
+            --add-data "LICENSE:." `
+            --add-data "README.md:." `
+            --hidden-import=websocket `
+            --hidden-import=pystray `
+            --hidden-import=pypresence `
+            --hidden-import=pysocks `
+            --hidden-import=PIL `
+            bzr_monitor.py -y
+
+      - name: Build executable (macOS)
+        if: matrix.os == 'macOS'
+        run: |
+          python -m PyInstaller --name bzr_monitor --onefile --windowed \
+            --add-data "LICENSE:." \
+            --add-data "README.md:." \
+            --hidden-import=websocket \
+            --hidden-import=pystray \
+            --hidden-import=pypresence \
+            --hidden-import=pysocks \
+            --hidden-import=PIL \
+            bzr_monitor.py -y
+
+      - name: Build executable (Linux)
+        if: matrix.os == 'Linux'
+        run: |
+          pip install patchelf
+          python -m PyInstaller --name bzr_monitor --onefile \
+            --add-data "LICENSE:." \
+            --add-data "README.md:." \
+            --hidden-import=websocket \
+            --hidden-import=pystray \
+            --hidden-import=pypresence \
+            --hidden-import=pysocks \
+            --hidden-import=PIL \
+            bzr_monitor.py -y
+
+      - name: Verify build output
+        shell: bash
+        run: |
+          ls -la dist/ || echo "dist directory not found"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: ${{ matrix.output-path }}
+          retention-days: 30
+
+  build-distributions:
+    name: Build Python distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install setuptools wheel build
+
+      - name: Build wheel and source distributions
+        run: |
+          python -m build
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/
+          retention-days: 30
+
+  create-release:
+    name: Create Release
+    needs: [build-exe, build-distributions]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Organize artifacts
+        run: |
+          mkdir -p releases
+          ls -la release-artifacts/
+          
+          # Copy Windows executable
+          if [ -f "release-artifacts/bzr_monitor-windows-x64.exe/bzr_monitor.exe" ]; then
+            cp "release-artifacts/bzr_monitor-windows-x64.exe/bzr_monitor.exe" "releases/bzr_monitor-windows-x64.exe"
+          fi
+          
+          # Copy macOS executable
+          if [ -f "release-artifacts/bzr_monitor-macos-x64/bzr_monitor" ]; then
+            cp "release-artifacts/bzr_monitor-macos-x64/bzr_monitor" "releases/bzr_monitor-macos-x64"
+            chmod +x releases/bzr_monitor-macos-x64
+          fi
+          
+          # Copy Linux executable
+          if [ -f "release-artifacts/bzr_monitor-linux-x64/bzr_monitor" ]; then
+            cp "release-artifacts/bzr_monitor-linux-x64/bzr_monitor" "releases/bzr_monitor-linux-x64"
+            chmod +x releases/bzr_monitor-linux-x64
+          fi
+          
+          # Copy Python distributions
+          cp release-artifacts/python-distributions/*.whl releases/ 2>/dev/null || true
+          cp release-artifacts/python-distributions/*.tar.gz releases/ 2>/dev/null || true
+          
+          # Create archives for executables
+          if [ -f "releases/bzr_monitor-windows-x64.exe" ]; then
+            cd releases && zip -q "bzr_monitor-${GITHUB_REF#refs/tags/}-windows-x64.zip" "bzr_monitor-windows-x64.exe" && cd ..
+          fi
+          
+          if [ -f "releases/bzr_monitor-macos-x64" ]; then
+            cd releases && tar -czf "bzr_monitor-${GITHUB_REF#refs/tags/}-macos-x64.tar.gz" "bzr_monitor-macos-x64" && cd ..
+          fi
+          
+          if [ -f "releases/bzr_monitor-linux-x64" ]; then
+            cd releases && tar -czf "bzr_monitor-${GITHUB_REF#refs/tags/}-linux-x64.tar.gz" "bzr_monitor-linux-x64" && cd ..
+          fi
+          
+          echo "Final release artifacts:"
+          ls -lh releases/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            releases/bzr_monitor-v*-windows-x64.zip
+            releases/bzr_monitor-v*-macos-x64.tar.gz
+            releases/bzr_monitor-v*-linux-x64.tar.gz
+            releases/bzr_monitor-1.0.0-py3-none-any.whl
+            releases/bzr_monitor-1.0.0.tar.gz
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
