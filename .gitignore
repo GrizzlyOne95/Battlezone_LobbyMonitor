@@ -1,1 +1,8 @@
 bzr_monitor_config.json
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+bzr_stats.csv
+*.vsix
+bin/tor/data/

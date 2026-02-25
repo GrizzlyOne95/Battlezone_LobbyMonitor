@@ -174,7 +174,7 @@ class BZLobbyMonitor:
             "auto_claim_name": "default",
             "auto_claim_bot_name": "",
             "rpc_enabled": False,
-            "rpc_client_id": "133570000000000000", # Placeholder
+            "rpc_client_id": "",  # Set your Discord Application Client ID from https://discord.com/developers/applications
             "sound_join": "",
             "sound_mention": "",
             "sound_griefer": ""
@@ -742,7 +742,7 @@ class BZLobbyMonitor:
         self.rpc_enabled_var = tk.BooleanVar(value=self.config.get("rpc_enabled", False))
         ttk.Checkbutton(rpc_frame, text="Enable Rich Presence", variable=self.rpc_enabled_var, command=self.toggle_rpc).pack(anchor="w")
         
-        ttk.Label(rpc_frame, text="Client ID (Optional):").pack(anchor="w")
+        ttk.Label(rpc_frame, text="Client ID (from discord.com/developers/applications — required):").pack(anchor="w")
         self.rpc_id_var = tk.StringVar(value=self.config.get("rpc_client_id", "133570000000000000"))
         ttk.Entry(rpc_frame, textvariable=self.rpc_id_var).pack(fill="x", pady=2)
         
@@ -1967,8 +1967,15 @@ class BZLobbyMonitor:
                 
             if str(lid) not in self.lobbies:
                 self.trigger_alert("new_lobby")
+
+            # Only run auto-ban check if the user list actually changed
+            old_users = set(self.lobbies.get(str(lid), {}).get("users", {}).keys())
+            new_users = set(lobby.get("users", {}).keys())
+            users_changed = old_users != new_users
+
             self.lobbies[str(lid)] = lobby
-            self.check_auto_ban_lobby(str(lid))
+            if users_changed:
+                self.check_auto_ban_lobby(str(lid))
         self.log(f"Lobbies Updated: {list(changed_lobbies.keys())}")
         self.root.after(0, self.refresh_tree)
         self.root.after(0, self.check_and_update_current_lobby)
@@ -2481,8 +2488,8 @@ class BZLobbyMonitor:
 
     def download_tor(self, target_dir):
         self.log("Downloading Tor Expert Bundle...")
-        # URL for Tor Expert Bundle Windows x86_64 (Stable)
-        url = "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.5/tor-expert-bundle-windows-x86_64-15.0.5.tar.gz"
+        # URL for Tor Expert Bundle Windows x86_64 (Stable) - uses dist.torproject.org stable redirect
+        url = "https://dist.torproject.org/torbrowser/tor-expert-bundle-windows-x86_64.tar.gz"
         self.log(f"URL: {url}")
         
         try:
@@ -2707,7 +2714,10 @@ class BZLobbyMonitor:
         while self.should_run and self.config.get("stats_enabled", False):
             try:
                 if self.lobbies:
-                    filename = "bzr_stats.csv"
+                    log_folder = self.config.get("log_folder", "").strip()
+                    if not log_folder or not os.path.exists(log_folder):
+                        log_folder = os.path.dirname(os.path.abspath(__file__))
+                    filename = os.path.join(log_folder, "bzr_stats.csv")
                     file_exists = os.path.isfile(filename)
                     
                     with open(filename, "a", newline="", encoding="utf-8") as f:
@@ -2984,8 +2994,11 @@ class BZLobbyMonitor:
 
     def init_rpc(self):
         if not HAS_RPC: return
+        client_id = self.config.get("rpc_client_id", "").strip()
+        if not client_id:
+            self.log("Discord RPC: No Client ID set. Please enter your Application Client ID in Bot Settings.")
+            return
         try:
-            client_id = self.config.get("rpc_client_id", "133570000000000000")
             self.rpc = Presence(client_id)
             self.rpc.connect()
             self.log("Discord RPC Connected.")
@@ -3018,7 +3031,10 @@ class BZLobbyMonitor:
 
         if w < 50: return
         
-        filename = "bzr_stats.csv"
+        log_folder = self.config.get("log_folder", "").strip()
+        if not log_folder or not os.path.exists(log_folder):
+            log_folder = os.path.dirname(os.path.abspath(__file__))
+        filename = os.path.join(log_folder, "bzr_stats.csv")
         if not os.path.exists(filename):
             self.stats_canvas.create_text(w/2, h/2, text="No stats data found.", fill="white")
             return
