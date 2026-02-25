@@ -1564,7 +1564,7 @@ class BZLobbyMonitor:
             # ID(1) + Magic(16) + ServerAddress(7) + MTU(2) + ClientGUID(8)
             return b'\x07' + magic + server_addr_bytes + mtu + self.client_guid
 
-        pkt_mode = 0 # 0:0x01, 1:0x02, 2:0x05, 3:0x07, 4:Connected
+        pkt_mode = 0 # 0:0x01(ping), 1:0x02(ping), 2:0x05(OCR1), 3:0x07(OCR2), 4..7:connected
         server_mtu = b'\x05\xd4' # Default 1492
         last_send_time = 0
         self.tx_seq = 0
@@ -1572,6 +1572,9 @@ class BZLobbyMonitor:
         self._connect_sent = False
         self._connect_rel_seq = 0
         query_log_counter = 0
+        send_now = False        # set True on rx to trigger immediate send without waiting 1s tick
+        last_http_poll = 0      # track HTTP poll time independently of query cycle
+        HTTP_POLL_INTERVAL = 15 # seconds between HTTP refreshes in idle mode
         
         # Packet Templates (Raw)
         pkt_connect = bytes.fromhex("8400000040009000000009040000001384b9fa00000000000503e100")
@@ -1585,11 +1588,11 @@ class BZLobbyMonitor:
         except:
             self.server_addr_bytes = b'\x04\x7f\x00\x00\x01' + port.to_bytes(2, 'big')
         
-        last_http_poll = 0
         while self.should_run:
             try:
-                # Rate limit sending to avoid flooding
-                if time.time() - last_send_time > 1.0:
+                # Send when: 1-second retry tick fires, OR send_now was set by a received packet
+                if send_now or (time.time() - last_send_time > 1.0):
+                    send_now = False
                     pkt = None
                     
                     if pkt_mode == 0: pkt = make_ping(b'\x01')
@@ -1597,37 +1600,37 @@ class BZLobbyMonitor:
                     elif pkt_mode == 2: pkt = make_ocr1()
                     elif pkt_mode == 3: pkt = make_ocr2(self.server_addr_bytes, server_mtu)
                     
-                    elif pkt_mode == 4: # Send Connect (0x09) — only send once, retransmit same rel_seq on timeout
-                        if not hasattr(self, '_connect_sent') or not self._connect_sent:
+                    elif pkt_mode == 4: # Send Connect (0x09) — retransmit same rel_seq until ACK'd
+                        if not self._connect_sent:
                             self.tx_rel_seq = (self.tx_rel_seq + 1) & 0xFFFFFF
                             self._connect_rel_seq = self.tx_rel_seq
                             self._connect_sent = True
                             self.log("Sending Connect (0x09)...")
-                        # Always retransmit with same rel_seq (server deduplicates by rel_seq)
                         pkt = self.patch_raknet_packet(pkt_connect, self._connect_rel_seq)
                         
                     elif pkt_mode == 5: # Send Login (0x13)
                         self.tx_rel_seq = (self.tx_rel_seq + 1) & 0xFFFFFF
                         pkt = self.make_login_packet(self.server_addr_bytes, port, self.tx_rel_seq)
                         self.log("Sending Login (0x13)...")
-                        pkt_mode = 6 # Advance to query immediately
+                        pkt_mode = 6
+                        send_now = True  # immediately follow up with query
                         
                     elif pkt_mode == 6: # Send Query (0x60)
                         self.tx_rel_seq = (self.tx_rel_seq + 1) & 0xFFFFFF
                         base = self.raknet_query if self.raknet_query else pkt_query
                         pkt = self.patch_raknet_packet(base, self.tx_rel_seq)
                         self.log("Sending Query (0x60)...")
-                        pkt_mode = 7 # Wait/Idle
-                        self.poll_http_lobby()
+                        pkt_mode = 7
+                        threading.Thread(target=self.poll_http_lobby, daemon=True).start()
+                        last_http_poll = time.time()
                         
-                    elif pkt_mode == 7: # Idle / Refresh
-                        if time.time() - last_send_time > 10.0:
-                            pkt_mode = 6 # Re-query
-                            # Also poll HTTP occasionally
-                            self.poll_http_lobby()
-                            continue
+                    elif pkt_mode == 7: # Idle — keepalive pings + periodic HTTP + re-query
+                        now = time.time()
+                        if now - last_http_poll >= HTTP_POLL_INTERVAL:
+                            pkt_mode = 6  # re-issue query
+                            send_now = True
                         else:
-                            # Connected Ping (0x00) wrapped in an Unreliable RakNet frame (0x84)
+                            # Connected Ping (0x00) wrapped in Unreliable RakNet frame (0x84)
                             # Frame: ID(1) + Seq(3) + Flags(1=Unreliable) + LenBits(2) + Payload
                             # Payload: MsgID(1=0x00) + Time(8) = 9 bytes = 0x48 bits
                             t_ms = int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF
@@ -1635,14 +1638,12 @@ class BZLobbyMonitor:
                             pkt = bytearray(b'\x84\x00\x00\x00\x00\x00\x48') + bytearray(ping_payload)
 
                     if pkt:
-                        # Patch Packet Sequence Number (Bytes 1-3 Little Endian)
+                        # Patch DatagramSeq (Bytes 1-3 Little Endian) for all frame-set packets
                         if 0x80 <= pkt[0] <= 0x8F:
                             seq_bytes = self.tx_seq.to_bytes(3, 'little')
                             pkt = pkt[0:1] + seq_bytes + pkt[4:]
                             self.tx_seq = (self.tx_seq + 1) & 0xFFFFFF
-                        
                         sock.sendto(pkt, (host, port))
-                        
                     last_send_time = time.time()
                 
                 try:
@@ -1652,25 +1653,24 @@ class BZLobbyMonitor:
                         
                         if pid == 0x1C: # Unconnected Pong
                             if len(data) > 33:
-                                payload = data[33:]
-                                server_info = payload.decode('utf-8', errors='ignore')
+                                server_info = data[33:].decode('utf-8', errors='ignore')
                                 self.log(f"RakNet Pong from {addr}: {server_info}")
                             else:
                                 self.log(f"RakNet Pong (No Data) from {addr}")
-                                if pkt_mode < 2:
-                                    pkt_mode += 1
-                                    self.log(f"Switching to mode {pkt_mode}...")
-                            
+                            # On any pong: if still in ping phase, jump straight to OCR1
+                            if pkt_mode < 2:
+                                pkt_mode = 2
+                                send_now = True
+                                self.log("Pong received — sending OCR1 immediately.")
                             self.register_direct_lobby(addr, "Ping OK")
                             
                         elif pid == 0x06: # Open Connection Reply 1
-                            # ID(1) + Magic(16) + ServerGUID(8) + Sec(1) + MTU(2)
                             if len(data) >= 28:
                                 server_mtu = data[26:28]
-                                if pkt_mode < 3:
-                                    pkt_mode = 3
-                                    self.log(f"RX Reply 1. MTU: {int.from_bytes(server_mtu, 'big')}. Sending OCR2...")
-                            
+                                self.log(f"RX Reply 1. MTU: {int.from_bytes(server_mtu, 'big')}. Sending OCR2...")
+                            if pkt_mode < 3:
+                                pkt_mode = 3
+                                send_now = True
                             self.register_direct_lobby(addr, "Handshake (1/2)")
 
                         elif pid == 0x08: # Open Connection Reply 2
@@ -1678,33 +1678,30 @@ class BZLobbyMonitor:
                             self.register_direct_lobby(addr, "Connected")
                             if pkt_mode < 4:
                                 pkt_mode = 4
+                                send_now = True
                                 self.log("Handshake Complete. Switching to Connected Mode (4).")
                             
                         elif 0x80 <= pid <= 0x8F: # RakNet Frame Set (Data)
-                            # 1. Extract Sequence Number (Bytes 1-3 Little Endian)
                             seq_bytes = data[1:4]
                             seq_num = int.from_bytes(seq_bytes, 'little')
                             
-                            # 2. Send ACK (0xC0)
-                            # Structure: ID(C0) + Count(00 01) + Equal(01) + Seq(3 bytes)
+                            # ACK: ID(C0) + BigEndianOrder(1) + Count(2) + MinEqMax(1) + Seq(3)
                             ack_pkt = b'\xC0\x00\x01\x01' + seq_bytes
                             sock.sendto(ack_pkt, (host, port))
                             
                             frames = self.parse_raknet_frames(data)
-                            # Only log if not just a Ping/Pong
                             is_ping_pong = all(f and f[0] in [0x00, 0x03] for f in frames)
                             if not is_ping_pong:
                                 self.log(f"RX FrameSet {len(data)}b (ID: {hex(pid)}) Seq: {seq_num} -> Sent ACK")
 
-                            for i, frame in enumerate(frames):
+                            for frame in frames:
                                 if not frame: continue
                                 msg_id = frame[0]
-                                # self.log(f"  Msg {i}: ID {hex(msg_id)} ({len(frame)}b)")
-                                
                                 if msg_id == 0x10:
                                     self.log("  -> Connection Request Accepted")
                                     if pkt_mode == 4:
-                                        pkt_mode = 5 # Proceed to Login
+                                        pkt_mode = 5
+                                        send_now = True  # send login immediately
                                 elif msg_id == 0x61:
                                     self.log("  -> Game List Response (0x61)")
                                     payload = frame[1:]
@@ -1713,14 +1710,15 @@ class BZLobbyMonitor:
                                         count = int.from_bytes(payload[:4], 'little')
                                         self.log(f"  -> Lobby Count: {count}")
                                         if count > 0:
-                                            self.poll_http_lobby()
+                                            threading.Thread(target=self.poll_http_lobby, daemon=True).start()
+                                            last_http_poll = time.time()
                         
                         else:
                             self.log(f"RX {len(data)}b from {addr} (ID: {hex(pid)})")
                 except socket.timeout:
                     pass
                 
-                time.sleep(0.05)  # Tight loop; socket timeout (2s) provides recv pacing
+                time.sleep(0.05)
             except Exception as e:
                 self.log(f"RakNet Error: {e}")
                 break
