@@ -1574,7 +1574,7 @@ class BZLobbyMonitor:
         query_log_counter = 0
         send_now = False        # set True on rx to trigger immediate send without waiting 1s tick
         last_http_poll = 0      # track HTTP poll time independently of query cycle
-        HTTP_POLL_INTERVAL = 15 # seconds between HTTP refreshes in idle mode
+        HTTP_POLL_INTERVAL = 3  # seconds — fast enough for near-real-time player join/leave detection
         
         # Packet Templates (Raw)
         pkt_connect = bytes.fromhex("8400000040009000000009040000001384b9fa00000000000503e100")
@@ -1615,11 +1615,11 @@ class BZLobbyMonitor:
                         pkt_mode = 6
                         send_now = True  # immediately follow up with query
                         
-                    elif pkt_mode == 6: # Send Query (0x60)
+                    elif pkt_mode == 6: # Send Query (0x60) — signals server we're active; data comes via HTTP
                         self.tx_rel_seq = (self.tx_rel_seq + 1) & 0xFFFFFF
                         base = self.raknet_query if self.raknet_query else pkt_query
                         pkt = self.patch_raknet_packet(base, self.tx_rel_seq)
-                        self.log("Sending Query (0x60)...")
+                        self.log("Sending Query (0x60) — polling HTTP for lobby data...")
                         pkt_mode = 7
                         threading.Thread(target=self.poll_http_lobby, daemon=True).start()
                         last_http_poll = time.time()
@@ -1787,7 +1787,7 @@ class BZLobbyMonitor:
                     p_name = p_decoded.split(b'\x00')[0].decode('utf-8', errors='replace')
                 except:
                     p_name = p_raw
-                users[pid] = {"name": p_name, "id": pid, "team": p.get("t"), "score": p.get("s")}
+                users[str(pid)] = {"name": p_name, "id": pid, "team": p.get("t"), "score": p.get("s")}
             
             lobby = {
                 "id": lid,
@@ -1806,11 +1806,44 @@ class BZLobbyMonitor:
                 "memberLimit": g.get("pm", 0),
                 "isLocked": str(g.get("l")) == "1",
                 "isPrivate": str(g.get("k")) == "1",
-                "owner": users[next(iter(users))]["id"] if users else "Unknown"
+                "owner": users[str(next(iter(users)))]["id"] if users else "Unknown"
             }
             new_lobbies[str(lid)] = lobby
-            
-        self.lobbies = new_lobbies
+
+        # Diff against previous state to synthesize join/leave/new-game/gone-game events
+        old_lobby_ids = set(k for k in self.lobbies if not k.startswith("direct_"))
+        new_lobby_ids = set(new_lobbies.keys())
+
+        for lid in new_lobby_ids - old_lobby_ids:
+            lobby = new_lobbies[lid]
+            lname = lobby["metadata"].get("name", lid)
+            self.log(f"[BZCC] New game: {lname}")
+            self.trigger_alert("new_lobby")
+
+        for lid in old_lobby_ids - new_lobby_ids:
+            lobby = self.lobbies[lid]
+            lname = lobby["metadata"].get("name", lid)
+            self.log(f"[BZCC] Game ended: {lname}")
+
+        for lid in new_lobby_ids & old_lobby_ids:
+            old_users = self.lobbies[lid].get("users", {})
+            new_users = new_lobbies[lid].get("users", {})
+            lname = new_lobbies[lid]["metadata"].get("name", lid)
+
+            for pid, pdata in new_users.items():
+                if pid not in old_users:
+                    pname = pdata.get("name", pid)
+                    self.log(f"[BZCC] {pname} joined {lname}")
+                    self.trigger_alert("player_join", pname)
+
+            for pid, pdata in old_users.items():
+                if pid not in new_users:
+                    pname = pdata.get("name", pid)
+                    self.log(f"[BZCC] {pname} left {lname}")
+
+        # Preserve non-BZCC entries (direct RakNet lobbies) then update
+        direct_lobbies = {k: v for k, v in self.lobbies.items() if k.startswith("direct_")}
+        self.lobbies = {**direct_lobbies, **new_lobbies}
         self.root.after(0, self.refresh_tree)
 
     def run_ws(self, url):
