@@ -1509,13 +1509,18 @@ class BZLobbyMonitor:
             
         if len(pkt) <= header_len: return pkt
         
-        # 2. Patch GUID only for Connection Request (0x09)
+        # 2. Patch GUID and timestamp for Connection Request (0x09)
         msg_id = pkt[header_len]
         if msg_id == 0x09:
-            # 0x09 Structure: ID(1) + GUID(8) + Time(8) + Sec(1)
+            # 0x09 Structure: ID(1) + ClientGUID(8) + Time(8) + DoSecurity(1)
             guid_offset = header_len + 1
-            if len(pkt) >= guid_offset + 8:
-                pkt = pkt[:guid_offset] + self.client_guid + pkt[guid_offset+8:]
+            time_offset = guid_offset + 8
+            if len(pkt) >= time_offset + 8:
+                t_ms = int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF
+                pkt = (pkt[:guid_offset]
+                       + self.client_guid
+                       + t_ms.to_bytes(8, 'big')
+                       + pkt[time_offset + 8:])
                 
         # 3. Patch Server Address for Login (0x13)
         if msg_id == 0x13 and hasattr(self, 'server_addr_bytes'):
@@ -1550,8 +1555,9 @@ class BZLobbyMonitor:
 
         def make_ocr1():
             # Open Connection Request 1 (0x05)
-            # ID(1) + Magic(16) + Protocol(1) + Padding(1446) = 1464 bytes
-            return b'\x05' + magic + b'\x06' + (b'\x00' * 1446)
+            # ID(1) + Magic(16) + Protocol(1) + NullPadding = 1400 bytes total
+            # 1400 is the standard RakNet MTU probe size; 1464 would be fragmented
+            return b'\x05' + magic + b'\x06' + (b'\x00' * 1382)
 
         def make_ocr2(server_addr_bytes, mtu):
             # Open Connection Request 2 (0x07)
@@ -1563,6 +1569,8 @@ class BZLobbyMonitor:
         last_send_time = 0
         self.tx_seq = 0
         self.tx_rel_seq = -1
+        self._connect_sent = False
+        self._connect_rel_seq = 0
         query_log_counter = 0
         
         # Packet Templates (Raw)
@@ -1589,10 +1597,14 @@ class BZLobbyMonitor:
                     elif pkt_mode == 2: pkt = make_ocr1()
                     elif pkt_mode == 3: pkt = make_ocr2(self.server_addr_bytes, server_mtu)
                     
-                    elif pkt_mode == 4: # Send Connect (0x09)
-                        self.tx_rel_seq = (self.tx_rel_seq + 1) & 0xFFFFFF
-                        pkt = self.patch_raknet_packet(pkt_connect, self.tx_rel_seq)
-                        self.log("Sending Connect (0x09)...")
+                    elif pkt_mode == 4: # Send Connect (0x09) — only send once, retransmit same rel_seq on timeout
+                        if not hasattr(self, '_connect_sent') or not self._connect_sent:
+                            self.tx_rel_seq = (self.tx_rel_seq + 1) & 0xFFFFFF
+                            self._connect_rel_seq = self.tx_rel_seq
+                            self._connect_sent = True
+                            self.log("Sending Connect (0x09)...")
+                        # Always retransmit with same rel_seq (server deduplicates by rel_seq)
+                        pkt = self.patch_raknet_packet(pkt_connect, self._connect_rel_seq)
                         
                     elif pkt_mode == 5: # Send Login (0x13)
                         self.tx_rel_seq = (self.tx_rel_seq + 1) & 0xFFFFFF
@@ -1615,11 +1627,12 @@ class BZLobbyMonitor:
                             self.poll_http_lobby()
                             continue
                         else:
-                            # Connected Ping (0x00) in Frame (0x84)
-                            # Header: 84 + Seq(3) + Flags(00) + Len(0048) + ID(00) + Time(8)
-                            pkt = bytearray.fromhex("84000000000048000000000000000000")
+                            # Connected Ping (0x00) wrapped in an Unreliable RakNet frame (0x84)
+                            # Frame: ID(1) + Seq(3) + Flags(1=Unreliable) + LenBits(2) + Payload
+                            # Payload: MsgID(1=0x00) + Time(8) = 9 bytes = 0x48 bits
                             t_ms = int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF
-                            pkt[8:] = t_ms.to_bytes(8, 'big')
+                            ping_payload = b'\x00' + t_ms.to_bytes(8, 'big')
+                            pkt = bytearray(b'\x84\x00\x00\x00\x00\x00\x48') + bytearray(ping_payload)
 
                     if pkt:
                         # Patch Packet Sequence Number (Bytes 1-3 Little Endian)
