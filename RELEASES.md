@@ -24,7 +24,7 @@ python -m PyInstaller --name "bzr_monitor" --onefile --windowed ^
 
 # The executable will be in dist/bzr_monitor.exe
 # Create a zip archive:
-# Compress-Archive -Path dist\bzr_monitor.exe -DestinationPath releases\bzr_monitor-v1.0.0-windows-x64.zip
+# Compress-Archive -Path dist\bzr_monitor.exe -DestinationPath releases\bzr_monitor-v1.1.0-windows-x64.zip
 ```
 
 #### macOS
@@ -39,7 +39,7 @@ python3 -m PyInstaller --name "bzr_monitor" --onefile --windowed \
 
 # Create a zip archive
 cd dist
-zip -r ../releases/bzr_monitor-v1.0.0-macos-x64.zip bzr_monitor.app/
+zip -r ../releases/bzr_monitor-v1.1.0-macos-x64.zip bzr_monitor.app/
 ```
 
 #### Linux
@@ -54,7 +54,7 @@ python3 -m PyInstaller --name "bzr_monitor" --onefile --windowed \
 
 # Create a tar archive
 cd dist
-tar -czf ../releases/bzr_monitor-v1.0.0-linux-x64.tar.gz bzr_monitor
+tar -czf ../releases/bzr_monitor-v1.1.0-linux-x64.tar.gz bzr_monitor
 ```
 
 ### Cross-Platform Distributions
@@ -72,10 +72,10 @@ python setup.py sdist
 These are located in `dist/` and can be installed with:
 ```bash
 # From wheel
-pip install dist/bzr_monitor-1.0.0-py3-none-any.whl
+pip install dist/bzr_monitor-1.1.0-py3-none-any.whl
 
 # From source
-pip install dist/bzr_monitor-1.0.0.tar.gz
+pip install dist/bzr_monitor-1.1.0.tar.gz
 ```
 
 ### Versioning and Tagging
@@ -83,8 +83,8 @@ pip install dist/bzr_monitor-1.0.0.tar.gz
 When creating a new release:
 
 1. Update version numbers in `setup.py` and `bzr_monitor.py` (if applicable)
-2. Commit changes: `git commit -am "Release v1.0.0"`
-3. Create a tag: `git tag -a v1.0.0 -m "Release version 1.0.0"`
+2. Commit changes: `git commit -am "Release v1.1.0"`
+3. Create a tag: `git tag -a v1.1.0 -m "Release version 1.1.0"`
 4. Push to repository:
    ```bash
    git push origin main
@@ -94,8 +94,8 @@ When creating a new release:
 ### Release Packages
 
 All release artifacts should be committed to the `releases/` directory:
-- `bzr_monitor-v1.0.0-windows-x64.zip` - Windows standalone executable
-- `bzr_monitor-v1.0.0-macos-x64.zip` - macOS standalone application
-- `bzr_monitor-v1.0.0-linux-x64.tar.gz` - Linux standalone executable
-- `bzr_monitor-1.0.0-py3-none-any.whl` - Python wheel (cross-platform)
-- `bzr_monitor-1.0.0.tar.gz` - Python source distribution
+- `bzr_monitor-v1.1.0-windows-x64.zip` - Windows standalone executable
+- `bzr_monitor-v1.1.0-macos-x64.zip` - macOS standalone application
+- `bzr_monitor-v1.1.0-linux-x64.tar.gz` - Linux standalone executable
+- `bzr_monitor-1.1.0-py3-none-any.whl` - Python wheel (cross-platform)
+- `bzr_monitor-1.1.0.tar.gz` - Python source distribution

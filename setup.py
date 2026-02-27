@@ -13,7 +13,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="bzr-monitor",
-    version="1.0.0",
+    version="1.1.0",
     author="GrizzlyOne95",
     description="A comprehensive external tool for monitoring Battlezone 98 Redux lobbies",
     long_description=long_description,
