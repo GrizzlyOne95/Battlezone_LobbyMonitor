@@ -25,6 +25,7 @@ import zipfile
 import subprocess
 import shutil
 import base64
+import zlib
 
 if sys.platform == 'win32':
     import winreg
@@ -99,6 +100,10 @@ class BZLobbyMonitor:
         self.tor_process = None
         self.raknet_query = None # Custom payload for RakNet connected state
         self.tx_rel_seq = -1 # Reliable Message Sequence Number
+        self.user_directory = {}
+        self.whitelist_info = {}
+        self.last_relay_status = None
+        self.last_server_statlog = None
         
         self.colors = {}
         self.load_config()
@@ -1441,23 +1446,187 @@ class BZLobbyMonitor:
         ttk.Button(ctrl, text="0x60", width=5, command=load_query).pack(side="left", padx=2)
         ttk.Button(ctrl, text="Set as Monitor Query", command=set_query).pack(side="left", padx=5)
 
-    def register_direct_lobby(self, addr, status="Online"):
+    def register_direct_lobby(self, addr, status="Online", pong=None):
         lid = f"direct_{addr[0]}_{addr[1]}"
+        existing = self.lobbies.get(lid, {})
+
+        metadata = dict(existing.get("metadata", {}))
+        users = dict(existing.get("users", {}))
+
+        metadata["name"] = metadata.get("name", f"Direct: {addr[0]}")
+        metadata["gameType"] = "BZCC (RakNet)"
+        metadata["connectionStatus"] = status
+
+        if pong:
+            map_name = pong.get("mapName") or "Unknown"
+            session_name = pong.get("sessionName") or f"Direct: {addr[0]}"
+            metadata["name"] = session_name
+            metadata["map"] = map_name
+            metadata["gameSettings"] = f"*{map_name}*"
+            metadata["ready"] = f"*{map_name}*"
+            metadata["version"] = pong.get("gameVersion", "?")
+            metadata["mods"] = pong.get("mods", "")
+            metadata["mapUrl"] = pong.get("mapUrl", "")
+            metadata["motd"] = pong.get("motd", "")
+            metadata["tps"] = pong.get("tps")
+
+            users = {}
+            for i, p in enumerate(pong.get("players", []), start=1):
+                pid = p.get("id", f"P{i}")
+                users[pid] = {
+                    "id": pid,
+                    "name": p.get("name", f"Player{i}"),
+                    "team": p.get("team"),
+                    "score": p.get("score"),
+                    "metadata": {"kills": p.get("kills"), "deaths": p.get("deaths")},
+                    "ipAddress": "unknown",
+                    "authType": "raknet"
+                }
+        else:
+            current_map = metadata.get("map")
+            if not current_map or current_map in ["Online", "Ping OK", "Handshake (1/2)", "Connected", "Unknown"]:
+                metadata["map"] = status
+            metadata["gameSettings"] = metadata.get("gameSettings", "*Unknown*")
+
         self.lobbies[lid] = {
             "id": lid,
-            "metadata": {
-                "name": f"Direct: {addr[0]}", 
-                "gameType": "BZCC (RakNet)", 
-                "map": status,
-                "gameSettings": "*Unknown*"
-            },
-            "users": {},
-            "memberLimit": 0,
-            "isLocked": False,
-            "isPrivate": False,
-            "owner": "Unknown"
+            "metadata": metadata,
+            "users": users,
+            "memberLimit": pong.get("maxPlayers", len(users)) if pong else existing.get("memberLimit", max(0, len(users))),
+            "isLocked": bool(pong.get("bLockedDown", False) if pong else existing.get("isLocked", False)),
+            "isPrivate": bool(pong.get("bPassworded", False) if pong else existing.get("isPrivate", False)),
+            "owner": existing.get("owner", "Unknown")
         }
         self.root.after(0, self.refresh_tree)
+
+    def _decode_null_terminated(self, raw):
+        if not raw:
+            return ""
+        idx = raw.find(b'\x00')
+        if idx >= 0:
+            raw = raw[:idx]
+        return raw.decode("utf-8", errors="replace").strip()
+
+    def parse_bz2_unconnected_pong(self, data):
+        # Parse the BZ2-style pong packet used by RaknetEmulator query-server flow.
+        try:
+            if len(data) < 40:
+                return None
+            if int.from_bytes(data[:4], "little") != 0x1C:
+                return None
+
+            off = 4
+            if data[off] != 0x00:
+                return None
+            off += 1
+
+            _pong_echo = int.from_bytes(data[off:off+4], "little")
+            off += 4
+            _server_guid = int.from_bytes(data[off:off+8], "little")
+            off += 8
+
+            for _ in range(3):
+                sw = data[off]
+                if sw not in (0x00, 0xFF):
+                    return None
+                off += 1
+
+            if data[off] != 0x00:
+                return None
+            off += 1
+
+            if len(data) < off + 12 + 10:
+                return None
+
+            off += 12  # fefefefe, fdfdfdfd, 0x78563412
+
+            data_version = data[off]
+            off += 1
+            bitfield_bits = int.from_bytes(data[off:off+4], "little")
+            off += 4
+            _time_limit = data[off]
+            _kill_limit = data[off + 1]
+            _game_time_minutes = data[off + 2]
+            off += 3
+            _max_ping = int.from_bytes(data[off:off+2], "little")
+            off += 2
+            game_version = int.from_bytes(data[off:off+2], "little")
+            off += 2
+            compressed_len = int.from_bytes(data[off:off+2], "little")
+            off += 2
+
+            if compressed_len <= 0 or len(data) < off + compressed_len:
+                return None
+
+            compressed_payload = data[off:off+compressed_len]
+            try:
+                inflated = zlib.decompress(compressed_payload)
+            except Exception:
+                try:
+                    inflated = zlib.decompress(compressed_payload[2:], -zlib.MAX_WBITS)
+                except Exception:
+                    return None
+
+            if len(inflated) < 1038:
+                inflated += b"\x00" * (1038 - len(inflated))
+
+            coff = 0
+
+            def read_bytes(n):
+                nonlocal coff
+                chunk = inflated[coff:coff+n]
+                coff += n
+                if len(chunk) < n:
+                    chunk += b"\x00" * (n - len(chunk))
+                return chunk
+
+            session_name = self._decode_null_terminated(read_bytes(44))
+            map_name = self._decode_null_terminated(read_bytes(32))
+            mods = self._decode_null_terminated(read_bytes(128))
+            map_url = self._decode_null_terminated(read_bytes(96))
+            motd = self._decode_null_terminated(read_bytes(128))
+
+            cur_players = (bitfield_bits & 0x3C) >> 2
+            max_players = (bitfield_bits & 0x3C0) >> 6
+            tps = (bitfield_bits & 0x7C00) >> 10
+            b_passworded = (bitfield_bits & 0x02) == 0x02
+            b_locked_down = (bitfield_bits & 0x8000) == 0x8000
+            cur_players = max(0, min(cur_players, 16))
+
+            players = []
+            for i in range(16):
+                uname = self._decode_null_terminated(read_bytes(33))
+                kills = read_bytes(1)[0]
+                deaths = read_bytes(1)[0]
+                team = read_bytes(1)[0]
+                score = int.from_bytes(read_bytes(2), "little", signed=True)
+                if i < cur_players:
+                    players.append({
+                        "id": f"P{i+1}",
+                        "name": uname if uname else f"Player{i+1}",
+                        "kills": kills,
+                        "deaths": deaths,
+                        "team": team,
+                        "score": score
+                    })
+
+            return {
+                "dataVersion": data_version,
+                "gameVersion": game_version,
+                "sessionName": session_name,
+                "mapName": map_name,
+                "mods": mods,
+                "mapUrl": map_url,
+                "motd": motd,
+                "players": players,
+                "curPlayers": cur_players,
+                "maxPlayers": max_players if max_players > 0 else max(cur_players, len(players)),
+                "bPassworded": b_passworded,
+                "bLockedDown": b_locked_down,
+                "tps": tps
+            }
+        except Exception:
+            return None
 
     def parse_raknet_frames(self, data):
         try:
@@ -1638,17 +1807,26 @@ class BZLobbyMonitor:
                         pid = data[0]
                         
                         if pid == 0x1C: # Unconnected Pong
-                            if len(data) > 33:
+                            parsed_pong = self.parse_bz2_unconnected_pong(data)
+                            if parsed_pong:
+                                p_cur = parsed_pong.get("curPlayers", 0)
+                                p_max = parsed_pong.get("maxPlayers", 0)
+                                p_map = parsed_pong.get("mapName", "Unknown")
+                                p_name = parsed_pong.get("sessionName", "Unknown")
+                                self.log(f"RakNet Pong from {addr}: '{p_name}' on '{p_map}' ({p_cur}/{p_max})")
+                                self.register_direct_lobby(addr, "Ping OK", parsed_pong)
+                            elif len(data) > 33:
                                 payload = data[33:]
                                 server_info = payload.decode('utf-8', errors='ignore')
                                 self.log(f"RakNet Pong from {addr}: {server_info}")
+                                self.register_direct_lobby(addr, "Ping OK")
                             else:
                                 self.log(f"RakNet Pong (No Data) from {addr}")
-                                if pkt_mode < 2:
-                                    pkt_mode += 1
-                                    self.log(f"Switching to mode {pkt_mode}...")
-                            
-                            self.register_direct_lobby(addr, "Ping OK")
+                                self.register_direct_lobby(addr, "Ping OK")
+
+                            if pkt_mode < 2:
+                                pkt_mode += 1
+                                self.log(f"Switching to mode {pkt_mode}...")
                             
                         elif pid == 0x06: # Open Connection Reply 1
                             # ID(1) + Magic(16) + ServerGUID(8) + Sec(1) + MTU(2)
@@ -1748,6 +1926,7 @@ class BZLobbyMonitor:
         # Map BZCC JSON (Model.cs) to internal lobby structure
         games = data.get("GET", [])
         new_lobbies = {}
+        direct_lobbies = {k: v for k, v in self.lobbies.items() if str(k).startswith("direct_")}
         
         for g in games:
             lid = g.get("g") # GUID
@@ -1789,7 +1968,16 @@ class BZLobbyMonitor:
                     "version": g.get("v", "?"),
                     "typeId": g.get("gt", 0),
                     "stateId": g.get("si", 0),
-                    "maxPlayers": g.get("pm", 0)
+                    "maxPlayers": g.get("pm", 0),
+                    # Additional lobbyServer telemetry (some labels inferred from legacy protocol usage)
+                    "gameTimeMinutes": g.get("gtm"),
+                    "typeDetailId": g.get("gtd"),
+                    "pingMs": g.get("pg"),
+                    "maxPingMs": g.get("pgm"),
+                    "modsCrc": g.get("d"),
+                    "natType": g.get("t"),
+                    "mapModCrc": g.get("mm"),
+                    "tps": g.get("tps")
                 },
                 "users": users,
                 "memberLimit": g.get("pm", 0),
@@ -1799,6 +1987,10 @@ class BZLobbyMonitor:
             }
             new_lobbies[str(lid)] = lobby
             
+        # Preserve live direct RakNet-discovered entries alongside HTTP list data.
+        for lid, lobby in direct_lobbies.items():
+            new_lobbies[lid] = lobby
+
         self.lobbies = new_lobbies
         self.root.after(0, self.refresh_tree)
 
@@ -1860,7 +2052,11 @@ class BZLobbyMonitor:
         try:
             data = json.loads(message)
             msg_type = data.get("type")
-            content = data.get("data", {})
+            content = data.get("data")
+            if content is None:
+                content = data.get("content")
+            if content is None:
+                content = {}
             
             if msg_type == "OnAuthorization":
                 success = content.get('success')
@@ -1872,6 +2068,12 @@ class BZLobbyMonitor:
                     self.set_player_data()
                     # Explicitly request lobby list
                     ws.send(json.dumps({"type": "GetLobbyList", "content": True}))
+
+                    # Admin-capable sessions can expose richer server-side state.
+                    if content.get("isAdmin") is True:
+                        ws.send(json.dumps({"type": "GetUserList", "content": True}))
+                        ws.send(json.dumps({"type": "GetStatLog", "content": True}))
+                        ws.send(json.dumps({"type": "GetFullLog", "content": True}))
             
             elif msg_type in ["OnLobbyListChanged", "OnLobbyList", "OnGetLobbyList"]:
                 self.handle_lobby_list(content)
@@ -1899,6 +2101,24 @@ class BZLobbyMonitor:
                 
             elif msg_type == "OnLobbyDataChanged":
                 self.handle_lobby_data_changed(content)
+
+            elif msg_type == "OnGetUserList":
+                self.handle_user_list(content)
+
+            elif msg_type == "OnGetStatLog":
+                self.handle_stat_log(content)
+
+            elif msg_type == "OnGetFullLog":
+                self.handle_full_log(content)
+
+            elif msg_type == "OnStdoutLogEntry":
+                self.handle_stdout_log_entry(content)
+
+            elif msg_type == "OnWhitelistUpdated":
+                self.handle_whitelist_updated(content)
+
+            elif msg_type in ["OnEnableRelayChanged", "OnRelayUpdated"]:
+                self.handle_relay_updated(content)
                 
         except Exception as e:
             self.log(f"Error parsing message: {e}")
@@ -1946,6 +2166,16 @@ class BZLobbyMonitor:
         else:
             new_lobbies = data
         self.lobbies = new_lobbies
+
+        # Cache any user snapshots piggy-backed in lobby payloads.
+        for _, lobby in self.lobbies.items():
+            users = lobby.get("users", {})
+            if isinstance(users, dict):
+                for uid, uobj in users.items():
+                    if isinstance(uobj, dict):
+                        self.user_directory[str(uid)] = uobj
+        self.merge_user_directory_into_lobbies()
+
         self.log(f"Received Full Lobby List: {len(self.lobbies)} lobbies.")
         self.root.after(0, self.refresh_tree)
         self.root.after(0, self.check_and_update_current_lobby)
@@ -1968,7 +2198,15 @@ class BZLobbyMonitor:
             if str(lid) not in self.lobbies:
                 self.trigger_alert("new_lobby")
             self.lobbies[str(lid)] = lobby
+
+            users = lobby.get("users", {})
+            if isinstance(users, dict):
+                for uid, uobj in users.items():
+                    if isinstance(uobj, dict):
+                        self.user_directory[str(uid)] = uobj
+
             self.check_auto_ban_lobby(str(lid))
+        self.merge_user_directory_into_lobbies()
         self.log(f"Lobbies Updated: {list(changed_lobbies.keys())}")
         self.root.after(0, self.refresh_tree)
         self.root.after(0, self.check_and_update_current_lobby)
@@ -2108,13 +2346,136 @@ class BZLobbyMonitor:
         self.log(f"!!! KICKING {name} (ID: {uid}) - Reason: {reason} !!!")
         self.ws.send(json.dumps({"type": "DoKickUser", "content": int(uid) if str(uid).isdigit() else uid}))
 
+    def _fmt_compact_value(self, value):
+        if value is None:
+            return "None"
+        if isinstance(value, (dict, list, tuple)):
+            try:
+                return json.dumps(value, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                return str(value)
+        return str(value)
+
+    def merge_user_directory_into_lobbies(self):
+        if not self.user_directory:
+            return
+        for _, lobby in self.lobbies.items():
+            users = lobby.get("users", {})
+            if not isinstance(users, dict):
+                continue
+            for uid, user in list(users.items()):
+                if not isinstance(user, dict):
+                    continue
+                snapshot = self.user_directory.get(str(uid), {})
+                if not isinstance(snapshot, dict):
+                    continue
+                merged = dict(snapshot)
+                merged.update(user)
+                merged_meta = {}
+                if isinstance(snapshot.get("metadata"), dict):
+                    merged_meta.update(snapshot.get("metadata", {}))
+                if isinstance(user.get("metadata"), dict):
+                    merged_meta.update(user.get("metadata", {}))
+                if merged_meta:
+                    merged["metadata"] = merged_meta
+                users[uid] = merged
+
+    def get_enriched_user(self, uid, user):
+        if not isinstance(user, dict):
+            return user
+        snapshot = self.user_directory.get(str(uid), {})
+        if not isinstance(snapshot, dict):
+            return user
+        merged = dict(snapshot)
+        merged.update(user)
+        merged_meta = {}
+        if isinstance(snapshot.get("metadata"), dict):
+            merged_meta.update(snapshot.get("metadata", {}))
+        if isinstance(user.get("metadata"), dict):
+            merged_meta.update(user.get("metadata", {}))
+        if merged_meta:
+            merged["metadata"] = merged_meta
+        return merged
+
+    def _cache_users_from_payload(self, payload):
+        if payload is None:
+            return 0
+        cached = 0
+        if isinstance(payload, dict):
+            if "users" in payload:
+                return self._cache_users_from_payload(payload.get("users"))
+            for uid, user in payload.items():
+                if isinstance(user, dict):
+                    cached += 1
+                    self.user_directory[str(uid)] = user
+        elif isinstance(payload, list):
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                uid = item.get("id") or item.get("member") or item.get("userId")
+                if uid is None:
+                    continue
+                cached += 1
+                self.user_directory[str(uid)] = item
+        return cached
+
     def handle_user_data_changed(self, data):
         member = data.get("member")
         self.log(f"User Data Changed: {member}")
+        updated = self._cache_users_from_payload(data)
+        if updated > 0:
+            self.merge_user_directory_into_lobbies()
+            self.root.after(0, self.refresh_tree)
+            self.root.after(0, lambda: self.on_lobby_select(None))
 
     def handle_lobby_data_changed(self, data):
         lid = data.get("changedLobby")
         self.log(f"Lobby Data Changed: {lid}")
+
+    def handle_user_list(self, data):
+        count = self._cache_users_from_payload(data)
+        self.merge_user_directory_into_lobbies()
+        self.log(f"Received User List Snapshot: {count} users.")
+        self.root.after(0, self.refresh_tree)
+        self.root.after(0, lambda: self.on_lobby_select(None))
+
+    def handle_stat_log(self, data):
+        self.last_server_statlog = data
+        if isinstance(data, (dict, list)):
+            self.log(f"Server StatLog Update ({len(data)} items)")
+        else:
+            self.log(f"Server StatLog Update: {self._fmt_compact_value(data)}")
+
+    def handle_full_log(self, data):
+        if isinstance(data, list):
+            for entry in data[-20:]:
+                self.log(f"[FULLLOG] {self._fmt_compact_value(entry)}")
+        else:
+            self.log(f"[FULLLOG] {self._fmt_compact_value(data)}")
+
+    def handle_stdout_log_entry(self, data):
+        self.log(f"[STDOUT] {self._fmt_compact_value(data)}")
+
+    def handle_whitelist_updated(self, data):
+        if isinstance(data, dict):
+            self.whitelist_info = data
+            whitelist = data.get("whitelist", {})
+            if isinstance(whitelist, dict):
+                lst = whitelist.get("list", [])
+                version = f"{whitelist.get('major', '?')}.{whitelist.get('minor', '?')}"
+                self.log(f"Whitelist Updated: {len(lst)} entries (v{version})")
+            else:
+                self.log("Whitelist Updated.")
+        else:
+            self.log(f"Whitelist Updated: {self._fmt_compact_value(data)}")
+
+    def handle_relay_updated(self, data):
+        self.last_relay_status = data
+        enabled = None
+        if isinstance(data, dict):
+            enabled = data.get("enabled")
+        status_str = "unknown" if enabled is None else ("enabled" if enabled else "disabled")
+        self.log(f"Relay Status Updated: {status_str}")
         
     def set_lobby_metadata(self, lobby_id):
         # Set default metadata for created lobbies (similar to ChatManager.js)
@@ -2168,7 +2529,6 @@ class BZLobbyMonitor:
         # Repopulate
         friends = self.config.get("friend_list", "").lower().splitlines()
         for lid, lobby in self.lobbies.items():
-            if str(lid).startswith("direct_"): continue
             meta = lobby.get("metadata", {})
             raw_name = meta.get("name", "Unknown")
             
@@ -2263,6 +2623,20 @@ class BZLobbyMonitor:
         self.lobby_details_text.insert("end", f"Lobby ID: {lobby.get('id')}\n")
         self.lobby_details_text.insert("end", f"Name: {l_meta.get('name')}\n")
         self.lobby_details_text.insert("end", f"Created: {lobby.get('createdTime')}\n")
+        if lobby.get("owner") is not None:
+            self.lobby_details_text.insert("end", f"Owner: {lobby.get('owner')}\n")
+        if lobby.get("userCount") is not None:
+            self.lobby_details_text.insert("end", f"User Count: {lobby.get('userCount')}\n")
+        if lobby.get("memberLimit") is not None:
+            self.lobby_details_text.insert("end", f"Member Limit: {lobby.get('memberLimit')}\n")
+        if lobby.get("isChat") is not None:
+            self.lobby_details_text.insert("end", f"Chat Lobby: {lobby.get('isChat')}\n")
+        if lobby.get("password") not in [None, ""]:
+            self.lobby_details_text.insert("end", f"Password: {lobby.get('password')}\n")
+        if lobby.get("isLocked") is not None:
+            self.lobby_details_text.insert("end", f"Locked: {lobby.get('isLocked')}\n")
+        if lobby.get("isPrivate") is not None:
+            self.lobby_details_text.insert("end", f"Private: {lobby.get('isPrivate')}\n")
         
         if l_meta.get("gameType") == "BZCC":
             gt = l_meta.get("typeId")
@@ -2280,6 +2654,35 @@ class BZLobbyMonitor:
             users = lobby.get("users", {})
             max_p = l_meta.get("maxPlayers", "?")
             self.lobby_details_text.insert("end", f"Players: {len(users)} / {max_p}\n")
+            if l_meta.get("tps") is not None:
+                self.lobby_details_text.insert("end", f"TPS: {l_meta.get('tps')}\n")
+            if l_meta.get("pingMs") is not None:
+                self.lobby_details_text.insert("end", f"Ping: {l_meta.get('pingMs')} ms (inferred)\n")
+            if l_meta.get("maxPingMs") is not None:
+                self.lobby_details_text.insert("end", f"Max Ping: {l_meta.get('maxPingMs')} ms\n")
+            if l_meta.get("gameTimeMinutes") is not None:
+                self.lobby_details_text.insert("end", f"Game Time: {l_meta.get('gameTimeMinutes')} min (inferred)\n")
+            if l_meta.get("typeDetailId") is not None:
+                self.lobby_details_text.insert("end", f"Type Detail ID: {l_meta.get('typeDetailId')} (inferred)\n")
+            if l_meta.get("natType") is not None:
+                self.lobby_details_text.insert("end", f"NAT Type: {l_meta.get('natType')}\n")
+            if l_meta.get("modsCrc"):
+                self.lobby_details_text.insert("end", f"Mods CRC: {l_meta.get('modsCrc')}\n")
+            if l_meta.get("mapModCrc"):
+                self.lobby_details_text.insert("end", f"Map/Mod CRC: {l_meta.get('mapModCrc')}\n")
+        elif l_meta.get("gameType") == "BZCC (RakNet)":
+            users = lobby.get("users", {})
+            self.lobby_details_text.insert("end", f"Status: {l_meta.get('connectionStatus', 'Unknown')}\n")
+            self.lobby_details_text.insert("end", f"Version: {l_meta.get('version', '?')}\n")
+            self.lobby_details_text.insert("end", f"Players: {len(users)} / {lobby.get('memberLimit', '?')}\n")
+            if l_meta.get("motd"):
+                self.lobby_details_text.insert("end", f"MOTD: {l_meta.get('motd')}\n")
+            if l_meta.get("mods"):
+                self.lobby_details_text.insert("end", f"Mods: {l_meta.get('mods')}\n")
+            if l_meta.get("mapUrl"):
+                self.lobby_details_text.insert("end", "Map URL: ")
+                self.insert_link(self.lobby_details_text, l_meta.get("mapUrl"), l_meta.get("mapUrl"))
+                self.lobby_details_text.insert("end", "\n")
         
         # Parse Game Settings from Lobby Metadata
         if game_settings:
@@ -2297,6 +2700,13 @@ class BZLobbyMonitor:
 
         if str(l_meta.get("launched")) == "1":
              self.lobby_details_text.insert("end", f"Status: Launched\n")
+
+        if l_meta:
+            self.lobby_details_text.insert("end", "\nMetadata:\n")
+            for key in sorted(l_meta.keys()):
+                if key in {"name", "gameType", "map", "gameSettings", "ready", "version", "typeId", "stateId", "maxPlayers"}:
+                    continue
+                self.lobby_details_text.insert("end", f" - {key}: {self._fmt_compact_value(l_meta.get(key))}\n")
              
         self.lobby_details_text.config(state="disabled")
 
@@ -2307,6 +2717,7 @@ class BZLobbyMonitor:
         users = lobby.get("users", {})
         friends = self.config.get("friend_list", "").lower().splitlines()
         for uid, user in users.items():
+            user = self.get_enriched_user(uid, user)
             user_name = user.get('name', 'Unknown')
             user_meta = user.get('metadata', {})
             
@@ -2322,6 +2733,14 @@ class BZLobbyMonitor:
             self.player_details_text.insert("end", "\n")
             self.player_details_text.insert("end", f"   IP: {user.get('ipAddress')}\n")
             self.player_details_text.insert("end", f"   Auth: {user.get('authType')}\n")
+            if user.get("clientVersion") is not None:
+                self.player_details_text.insert("end", f"   Client: {user.get('clientVersion')}\n")
+            if user.get("lobby") is not None:
+                self.player_details_text.insert("end", f"   Lobby: {user.get('lobby')}\n")
+            if user.get("isAdmin") is not None:
+                self.player_details_text.insert("end", f"   Admin: {user.get('isAdmin')}\n")
+            if user.get("isInLounge") is not None:
+                self.player_details_text.insert("end", f"   In Lounge: {user.get('isInLounge')}\n")
             
             # Geo Lookup
             ip = user.get('ipAddress')
@@ -2363,6 +2782,13 @@ class BZLobbyMonitor:
                         self.player_details_text.insert("end", f"   Ready Map: {r_parts[1]}\n")
                 if user_meta.get('launched') == "1":
                     self.player_details_text.insert("end", f"   Status: Launched\n")
+
+                # Show remaining metadata keys to expose new server-side fields.
+                known_meta = {"team", "vehicle", "ready", "launched", "name"}
+                for mk in sorted(user_meta.keys()):
+                    if mk in known_meta:
+                        continue
+                    self.player_details_text.insert("end", f"   meta.{mk}: {self._fmt_compact_value(user_meta.get(mk))}\n")
             
             # Network Info
             wan = user.get('wanAddress')
