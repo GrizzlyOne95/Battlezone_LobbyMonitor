@@ -56,6 +56,14 @@ A comprehensive external tool for monitoring, interacting with, and automating B
     python bzr_monitor.py
     ```
 
+## Testing
+
+Run the helper/unit tests with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## Configuration
 
 All settings can be managed via the **Configuration** tab in the application:
@@ -77,6 +85,7 @@ To use the Relay features, navigate to the **Discord Integration** tab:
 *   `websocket-client`: For connecting to the BZ98R lobby server.
 *   `Pillow`: For processing map and mod preview images.
 *   `pypresence`: For Discord Rich Presence support.
+*   `pystray`: For system tray and passive/background operation.
 
 ## Supported Games
 

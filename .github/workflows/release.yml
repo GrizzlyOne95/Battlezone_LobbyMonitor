@@ -182,8 +182,8 @@ jobs:
             releases/bzr_monitor-v*-windows-x64.zip
             releases/bzr_monitor-v*-macos-x64.tar.gz
             releases/bzr_monitor-v*-linux-x64.tar.gz
-            releases/bzr_monitor-1.0.0-py3-none-any.whl
-            releases/bzr_monitor-1.0.0.tar.gz
+            releases/bzr_monitor-*.whl
+            releases/bzr_monitor-*.tar.gz
           draft: false
           prerelease: false
           generate_release_notes: true

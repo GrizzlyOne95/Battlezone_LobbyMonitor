@@ -24,8 +24,26 @@ import tarfile
 import zipfile
 import subprocess
 import shutil
-import base64
-import zlib
+from bzr_monitor_utils import (
+    aggregate_recent_player_counts,
+    build_bzcc_lobby,
+    clean_lobby_name,
+    extract_lobby_version,
+    format_age,
+    extract_map_name_from_game_settings,
+    extract_map_name_from_metadata,
+    extract_workshop_mod_id,
+    get_lobby_age_label,
+    get_lobby_network_label,
+    get_lobby_source,
+    get_lobby_status_flags,
+    get_lobby_last_seen,
+    is_lobby_stale,
+    parse_bz2_unconnected_pong as parse_bz2_unconnected_pong_packet,
+    parse_raknet_frames as parse_raknet_frames_packet,
+    stamp_lobby,
+    should_relay_discord_message,
+)
 
 if sys.platform == 'win32':
     import winreg
@@ -76,7 +94,8 @@ class BZLobbyMonitor:
             icon_path = os.path.join(base_dir, "bzrmon.ico")
             if os.path.exists(icon_path):
                 self.root.iconbitmap(icon_path)
-        except: pass
+        except Exception as e:
+            print(f"WARNING: Failed to load window icon: {e}", file=sys.stderr)
         
         self.lobbies = {}
         self.ws = None
@@ -88,10 +107,16 @@ class BZLobbyMonitor:
         self.image_cache = {}
         self.pending_fetches = set()
         self.discord_bot_id = None
+        self.discord_bot_token = None
         self.discord_thread = None
         self.muted_users = set()
         self.geo_cache = {}
+        self.geo_lookup_failures = set()
         self.rpc = None
+        self.rpc_update_error_logged = False
+        self.stats_thread = None
+        self.stats_stop_event = threading.Event()
+        self.last_log_cleanup_day = None
         self.last_announce_time = time.time()
         self.last_event_announce_time = 0
         self.last_welcome_times = {}
@@ -111,6 +136,8 @@ class BZLobbyMonitor:
         self.setup_styles()
         self.setup_ui()
         self.apply_config()
+        self.cleanup_logs()
+        self.start_periodic_ui_refresh()
         
         # Start stats logger if enabled
         if self.config.get("stats_enabled", False):
@@ -188,7 +215,8 @@ class BZLobbyMonitor:
             try:
                 with open(CONFIG_FILE, "r") as f:
                     self.config.update(json.load(f))
-            except: pass
+            except Exception as e:
+                print(f"WARNING: Failed to load config '{CONFIG_FILE}': {e}", file=sys.stderr)
 
     def load_custom_fonts(self):
         self.custom_font_name = "Consolas"
@@ -200,7 +228,8 @@ class BZLobbyMonitor:
                 try:
                     if ctypes.windll.gdi32.AddFontResourceExW(font_path, 0x10, 0) > 0:
                         self.custom_font_name = "BZONE"
-                except: pass
+                except Exception as e:
+                    print(f"WARNING: Failed to load custom font '{font_path}': {e}", file=sys.stderr)
         else:
             self.custom_font_name = "Monospace"
 
@@ -244,11 +273,31 @@ class BZLobbyMonitor:
             self.root.after(duration, lambda: button.config(text=original_text) if button.winfo_exists() else None)
         except: pass
 
+    def warn(self, message):
+        line = f"WARNING: {message}"
+        try:
+            if hasattr(self, "root") and self.root and self.root.winfo_exists():
+                self.root.after(0, lambda m=line: self._warn_impl(m))
+            else:
+                print(line, file=sys.stderr)
+        except Exception:
+            print(line, file=sys.stderr)
+
+    def _warn_impl(self, message):
+        if hasattr(self, "log_text") and self.log_text.winfo_exists():
+            self.log_text.config(state="normal")
+            self.log_text.insert("end", message + "\n")
+            self.log_text.see("end")
+            self.log_text.config(state="disabled")
+        else:
+            print(message, file=sys.stderr)
+
     def save_config(self):
         try:
             with open(CONFIG_FILE, "w") as f:
                 json.dump(self.config, f, indent=4)
-        except: pass
+        except Exception as e:
+            print(f"WARNING: Failed to save config '{CONFIG_FILE}': {e}", file=sys.stderr)
 
     def setup_ui(self):
         self.notebook = ttk.Notebook(self.root)
@@ -391,7 +440,7 @@ class BZLobbyMonitor:
         lobby_frame = ttk.LabelFrame(paned, text="Lobbies", padding=5)
         paned.add(lobby_frame, weight=3)
         
-        columns = ("ID", "Name", "Map", "Owner", "Players", "Type", "Version", "Locked", "Private")
+        columns = ("ID", "Name", "Map", "Players", "Source", "Age", "Status", "Net", "Version")
         self.tree = ttk.Treeview(lobby_frame, columns=columns, show="headings")
         
         for col in columns:
@@ -400,7 +449,12 @@ class BZLobbyMonitor:
         self.tree.column("Name", width=200)
         self.tree.column("Map", width=120)
         self.tree.column("ID", width=60)
-        self.tree.column("Players", width=60)
+        self.tree.column("Players", width=70)
+        self.tree.column("Source", width=90)
+        self.tree.column("Age", width=60)
+        self.tree.column("Status", width=180)
+        self.tree.column("Net", width=90)
+        self.tree.column("Version", width=70)
         
         scrollbar = ttk.Scrollbar(lobby_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
@@ -420,6 +474,24 @@ class BZLobbyMonitor:
         
         self.preview_label = ttk.Label(details_frame, text="No Preview", anchor="center", background="#000000")
         self.preview_label.pack(side="top", fill="x", pady=(0, 5))
+
+        badge_frame = ttk.Frame(details_frame)
+        badge_frame.pack(fill="x", pady=(0, 5))
+        self.lobby_badges = {}
+        for key in ("source", "freshness", "state", "network", "relay"):
+            lbl = tk.Label(
+                badge_frame,
+                text="--",
+                bg="#1a1a1a",
+                fg=self.colors["fg"],
+                padx=6,
+                pady=2,
+                relief="groove",
+                bd=1,
+                font=("Consolas", 9, "bold"),
+            )
+            lbl.pack(side="left", padx=(0, 4))
+            self.lobby_badges[key] = lbl
         
         self.lobby_details_text = tk.Text(details_frame, height=10, width=30, state="disabled", 
                                           bg="#050505", fg=self.colors["fg"], insertbackground=self.colors["highlight"], font=("Consolas", 9))
@@ -447,14 +519,45 @@ class BZLobbyMonitor:
         # 3. Player Details (Right)
         player_frame = ttk.LabelFrame(bottom_pane, text="Player Details", padding=5)
         bottom_pane.add(player_frame, weight=1)
-        
-        self.player_details_text = tk.Text(player_frame, height=10, width=30, state="disabled",
-                                           bg="#050505", fg=self.colors["fg"], insertbackground=self.colors["highlight"], font=("Consolas", 9))
-        self.player_details_text.pack(fill="both", expand=True)
-        self.player_details_text.bind("<Button-3>", self.show_player_context_menu)
+
+        player_columns = ("Name", "ID", "Auth", "IP", "Geo", "Team", "Score", "Admin", "Status")
+        player_grid_frame = ttk.Frame(player_frame)
+        player_grid_frame.pack(fill="both", expand=True)
+        self.player_tree = ttk.Treeview(player_grid_frame, columns=player_columns, show="headings", height=9)
+        for col in player_columns:
+            self.player_tree.heading(col, text=col, command=lambda c=col: self.sort_player_tree(c, False))
+            self.player_tree.column(col, width=90)
+        self.player_tree.column("Name", width=140)
+        self.player_tree.column("ID", width=110)
+        self.player_tree.column("Auth", width=55)
+        self.player_tree.column("IP", width=95)
+        self.player_tree.column("Geo", width=120)
+        self.player_tree.column("Team", width=45)
+        self.player_tree.column("Score", width=55)
+        self.player_tree.column("Admin", width=55)
+        self.player_tree.column("Status", width=110)
+
+        player_scroll = ttk.Scrollbar(player_grid_frame, orient="vertical", command=self.player_tree.yview)
+        self.player_tree.configure(yscrollcommand=player_scroll.set)
+        self.player_tree.pack(side="left", fill="both", expand=True)
+        player_scroll.pack(side="right", fill="y")
+        self.player_tree.bind("<<TreeviewSelect>>", self.on_player_select)
+        self.player_tree.bind("<Button-3>", self.show_player_context_menu)
+
+        self.player_meta_text = tk.Text(
+            player_frame,
+            height=8,
+            width=30,
+            state="disabled",
+            bg="#050505",
+            fg=self.colors["fg"],
+            insertbackground=self.colors["highlight"],
+            font=("Consolas", 9),
+        )
+        self.player_meta_text.pack(fill="x", expand=False, pady=(5, 0))
 
         # Configure tags for links
-        for widget in [self.lobby_details_text, self.player_details_text, self.log_text]:
+        for widget in [self.lobby_details_text, self.player_meta_text, self.log_text]:
             widget.tag_config("link", foreground=self.colors["accent"], underline=1)
             widget.tag_bind("link", "<Enter>", lambda e, w=widget: w.config(cursor="hand2"))
             widget.tag_bind("link", "<Leave>", lambda e, w=widget: w.config(cursor=""))
@@ -469,6 +572,11 @@ class BZLobbyMonitor:
         
         # Treeview tags
         self.tree.tag_configure("friend", foreground=self.colors["highlight"])
+        self.tree.tag_configure("stale", foreground="#ffcc66")
+        self.tree.tag_configure("launched", foreground=self.colors["accent"])
+        self.player_tree.tag_configure("friend", foreground=self.colors["highlight"])
+        self.player_tree.tag_configure("griefer", foreground="red")
+        self.player_tree.tag_configure("admin", foreground=self.colors["accent"])
 
     def setup_config_tab(self):
         scroll_frame = self.create_scrollable_frame(self.config_tab)
@@ -760,7 +868,7 @@ class BZLobbyMonitor:
         ctrl = ttk.Frame(container)
         ctrl.pack(fill="x", pady=5)
         ttk.Button(ctrl, text="Refresh Graph", command=self.draw_stats).pack(side="left")
-        ttk.Label(ctrl, text="Active Players (Last 24h)").pack(side="left", padx=10)
+        ttk.Label(ctrl, text="Active Players (Last 24h, 5-minute buckets)").pack(side="left", padx=10)
         
         self.stats_canvas = tk.Canvas(container, bg="#1a1a1a", highlightthickness=0)
         self.stats_canvas.pack(fill="both", expand=True)
@@ -807,6 +915,151 @@ class BZLobbyMonitor:
             self.tree.move(k, '', index)
 
         self.tree.heading(col, command=lambda: self.sort_tree(col, not reverse))
+
+    def sort_player_tree(self, col, reverse):
+        rows = [(self.player_tree.set(k, col), k) for k in self.player_tree.get_children('')]
+        try:
+            rows.sort(key=lambda t: int(t[0]) if str(t[0]).lstrip("-").isdigit() else str(t[0]).lower(), reverse=reverse)
+        except ValueError:
+            rows.sort(key=lambda t: str(t[0]).lower(), reverse=reverse)
+
+        for index, (_, item_id) in enumerate(rows):
+            self.player_tree.move(item_id, '', index)
+
+        self.player_tree.heading(col, command=lambda: self.sort_player_tree(col, not reverse))
+
+    def get_relay_enabled_flag(self):
+        if isinstance(self.last_relay_status, dict):
+            return self.last_relay_status.get("enabled")
+        return None
+
+    def mark_lobby_seen(self, lobby, source):
+        if isinstance(lobby, dict):
+            stamp_lobby(lobby, source)
+        return lobby
+
+    def set_lobby_badge(self, key, text, fg=None, bg=None):
+        label = self.lobby_badges.get(key)
+        if not label:
+            return
+        label.config(
+            text=text,
+            fg=fg or self.colors["fg"],
+            bg=bg or "#1a1a1a",
+        )
+
+    def update_lobby_badges(self, lobby):
+        relay_enabled = self.get_relay_enabled_flag()
+        source = get_lobby_source(lobby, default="Source: ?")
+        age_text = get_lobby_age_label(lobby, default="?")
+        last_seen = get_lobby_last_seen(lobby)
+        freshness_text = f"Seen {age_text}"
+        if last_seen:
+            freshness_text = f"{freshness_text} ago"
+        is_stale = is_lobby_stale(lobby)
+        network_text = get_lobby_network_label(lobby, default="-")
+        status_flags = get_lobby_status_flags(lobby, relay_status=relay_enabled)
+        relay_text = "Relay ?" if relay_enabled is None else ("Relay On" if relay_enabled else "Relay Off")
+
+        self.set_lobby_badge("source", source, bg="#15313a")
+        self.set_lobby_badge("freshness", freshness_text, bg="#3a2f15" if is_stale else "#153a20")
+        self.set_lobby_badge("state", " | ".join(status_flags[:3]) if status_flags else "State: Normal", bg="#2a1f3a")
+        self.set_lobby_badge("network", network_text, bg="#1f1f3a")
+        relay_bg = "#2a2a2a" if relay_enabled is None else ("#203a35" if relay_enabled else "#3a2020")
+        self.set_lobby_badge("relay", relay_text, bg=relay_bg)
+
+    def start_periodic_ui_refresh(self):
+        self.root.after(5000, self._periodic_ui_refresh)
+
+    def _periodic_ui_refresh(self):
+        if not self.root.winfo_exists():
+            return
+        try:
+            if self.lobbies:
+                self.refresh_tree()
+                self.on_lobby_select(None)
+        finally:
+            if self.root.winfo_exists():
+                self.root.after(5000, self._periodic_ui_refresh)
+
+    def clear_player_meta(self, message="Select a player for details."):
+        self.player_meta_text.config(state="normal")
+        self.player_meta_text.delete("1.0", "end")
+        self.player_meta_text.insert("end", message)
+        self.player_meta_text.config(state="disabled")
+
+    def get_selected_player_context(self):
+        selected = self.player_tree.selection()
+        if not selected:
+            return None, None
+
+        uid = str(self.player_tree.item(selected[0])["values"][1])
+        if self.current_lobby_id is None:
+            return uid, None
+
+        lobby = self.lobbies.get(str(self.current_lobby_id))
+        if not lobby:
+            return uid, None
+
+        user = lobby.get("users", {}).get(uid)
+        if user is None:
+            for alt_uid, alt_user in lobby.get("users", {}).items():
+                if str(alt_uid) == uid:
+                    user = alt_user
+                    uid = str(alt_uid)
+                    break
+        return uid, user
+
+    def on_player_select(self, event=None):
+        uid, user = self.get_selected_player_context()
+        if uid is None or user is None:
+            self.clear_player_meta()
+            return
+        self.render_selected_player_meta(uid, user)
+
+    def render_selected_player_meta(self, uid, user):
+        user = self.get_enriched_user(uid, user)
+        user_meta = user.get("metadata", {}) if isinstance(user, dict) else {}
+        ip = user.get("ipAddress")
+        geo = self.get_geo_info(ip) if ip and ip != "unknown" else None
+
+        self.player_meta_text.config(state="normal")
+        self.player_meta_text.delete("1.0", "end")
+        self.player_meta_text.insert("end", f"Name: {user.get('name', 'Unknown')}\n")
+        self.player_meta_text.insert("end", f"ID: {uid}\n")
+        self.player_meta_text.insert("end", f"Auth: {user.get('authType', '')}\n")
+        self.player_meta_text.insert("end", f"IP: {ip or ''}\n")
+        if geo:
+            self.player_meta_text.insert("end", f"Geo: {geo}\n")
+        if user.get("clientVersion") is not None:
+            self.player_meta_text.insert("end", f"Client: {user.get('clientVersion')}\n")
+        if user.get("isAdmin") is not None:
+            self.player_meta_text.insert("end", f"Admin: {user.get('isAdmin')}\n")
+        if user.get("isInLounge") is not None:
+            self.player_meta_text.insert("end", f"In Lounge: {user.get('isInLounge')}\n")
+        if user.get("wanAddress") and user.get("wanAddress") != "unknown":
+            self.player_meta_text.insert("end", f"WAN: {user.get('wanAddress')}\n")
+        lans = user.get("lanAddresses")
+        if lans:
+            lan_text = ", ".join(lans) if isinstance(lans, list) else str(lans)
+            self.player_meta_text.insert("end", f"LAN: {lan_text}\n")
+        if user.get("lobby") is not None:
+            self.player_meta_text.insert("end", f"Lobby: {user.get('lobby')}\n")
+        if uid.startswith("S"):
+            steam_id = uid[1:]
+            self.player_meta_text.insert("end", "Profile: ")
+            self.insert_link(self.player_meta_text, steam_id, f"https://steamcommunity.com/profiles/{steam_id}")
+            self.player_meta_text.insert("end", "\n")
+
+        if user_meta:
+            self.player_meta_text.insert("end", "\nMetadata:\n")
+            known_meta = {"team", "vehicle", "ready", "launched", "name"}
+            for mk in sorted(user_meta.keys()):
+                if mk in known_meta:
+                    continue
+                self.player_meta_text.insert("end", f" - {mk}: {self._fmt_compact_value(user_meta.get(mk))}\n")
+
+        self.player_meta_text.config(state="disabled")
 
     def save_ui_config(self):
         self.config["proxy_enabled"] = self.proxy_enabled_var.get()
@@ -947,7 +1200,8 @@ class BZLobbyMonitor:
                 try:
                     winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
                     played = True
-                except: pass
+                except Exception as e:
+                    self.warn(f"Failed to play sound '{path}': {e}")
         
         if not played:
             self.root.bell()
@@ -956,14 +1210,17 @@ class BZLobbyMonitor:
         if sys.platform == 'win32':
             try:
                 ctypes.windll.user32.FlashWindow(int(self.root.wm_frame(), 16), True)
-            except: pass
+            except Exception as e:
+                self.warn(f"Failed to flash window: {e}")
         else:
             try:
                 self.root.wm_attributes("-demands-attention", True)
-            except: pass
+            except Exception as e:
+                self.warn(f"Failed to request window attention: {e}")
 
     def quit_app(self):
         self.should_run = False
+        self.stop_stats_logger()
         if self.tray_icon:
             self.tray_icon.stop()
         if self.tor_process:
@@ -1004,7 +1261,8 @@ class BZLobbyMonitor:
                     image = Image.open(icon_path)
                 else:
                     image = Image.new('RGB', (64, 64), color = (0, 255, 0))
-            except: pass
+            except Exception as e:
+                self.warn(f"Failed to initialize tray icon image: {e}")
 
         if image:
             menu = (item('Show', show_window), item('Quit', quit_tray))
@@ -1082,12 +1340,16 @@ class BZLobbyMonitor:
 
     def show_player_context_menu(self, event):
         try:
-            index = self.player_details_text.index(f"@{event.x},{event.y}")
-            line = self.player_details_text.get(f"{index} linestart", f"{index} lineend")
-            match = re.search(r" - (.*?) \(ID: (.*?)\)", line)
-            if match:
-                name = match.group(1)
-                uid = match.group(2)
+            row_id = self.player_tree.identify_row(event.y)
+            if row_id:
+                self.player_tree.selection_set(row_id)
+            selected = self.player_tree.selection()
+            if selected:
+                values = self.player_tree.item(selected[0]).get("values", [])
+                if len(values) < 2:
+                    return
+                name = values[0]
+                uid = str(values[1])
                 menu = tk.Menu(self.root, tearoff=0)
                 menu.add_command(label=f"Add '{name}' to Watch List", command=lambda: self.add_to_watch_list(name))
                 menu.add_command(label=f"Add ID '{uid}' to Watch List", command=lambda: self.add_to_watch_list(uid))
@@ -1111,9 +1373,10 @@ class BZLobbyMonitor:
                         if str(self.my_id) == owner and str(self.my_id) != str(uid):
                              menu.add_separator()
                              menu.add_command(label=f"Kick '{name}'", command=lambda: self.kick_user(uid, name))
-                
+                        
                 menu.post(event.x_root, event.y_root)
-        except Exception as e: pass
+        except Exception as e:
+            self.warn(f"Player context menu failed: {e}")
 
     def add_to_watch_list(self, text):
         current = self.watch_list_text.get("1.0", "end-1c")
@@ -1268,6 +1531,7 @@ class BZLobbyMonitor:
 
     def _file_log(self, message):
         try:
+            self.cleanup_logs()
             folder = self.config.get("log_folder", "")
             if not folder or not os.path.exists(folder):
                 folder = "."
@@ -1275,7 +1539,8 @@ class BZLobbyMonitor:
             timestamp = datetime.now().strftime("[%H:%M:%S]")
             with open(filename, "a", encoding="utf-8") as f:
                 f.write(f"{timestamp} {message}\n")
-        except: pass
+        except Exception as e:
+            print(f"WARNING: Failed to write file log: {e}", file=sys.stderr)
 
     def toggle_connection(self):
         if self.connected:
@@ -1488,7 +1753,7 @@ class BZLobbyMonitor:
                 metadata["map"] = status
             metadata["gameSettings"] = metadata.get("gameSettings", "*Unknown*")
 
-        self.lobbies[lid] = {
+        self.lobbies[lid] = self.mark_lobby_seen({
             "id": lid,
             "metadata": metadata,
             "users": users,
@@ -1496,163 +1761,14 @@ class BZLobbyMonitor:
             "isLocked": bool(pong.get("bLockedDown", False) if pong else existing.get("isLocked", False)),
             "isPrivate": bool(pong.get("bPassworded", False) if pong else existing.get("isPrivate", False)),
             "owner": existing.get("owner", "Unknown")
-        }
+        }, "BZCC UDP")
         self.root.after(0, self.refresh_tree)
 
-    def _decode_null_terminated(self, raw):
-        if not raw:
-            return ""
-        idx = raw.find(b'\x00')
-        if idx >= 0:
-            raw = raw[:idx]
-        return raw.decode("utf-8", errors="replace").strip()
-
     def parse_bz2_unconnected_pong(self, data):
-        # Parse the BZ2-style pong packet used by RaknetEmulator query-server flow.
-        try:
-            if len(data) < 40:
-                return None
-            if int.from_bytes(data[:4], "little") != 0x1C:
-                return None
-
-            off = 4
-            if data[off] != 0x00:
-                return None
-            off += 1
-
-            _pong_echo = int.from_bytes(data[off:off+4], "little")
-            off += 4
-            _server_guid = int.from_bytes(data[off:off+8], "little")
-            off += 8
-
-            for _ in range(3):
-                sw = data[off]
-                if sw not in (0x00, 0xFF):
-                    return None
-                off += 1
-
-            if data[off] != 0x00:
-                return None
-            off += 1
-
-            if len(data) < off + 12 + 10:
-                return None
-
-            off += 12  # fefefefe, fdfdfdfd, 0x78563412
-
-            data_version = data[off]
-            off += 1
-            bitfield_bits = int.from_bytes(data[off:off+4], "little")
-            off += 4
-            _time_limit = data[off]
-            _kill_limit = data[off + 1]
-            _game_time_minutes = data[off + 2]
-            off += 3
-            _max_ping = int.from_bytes(data[off:off+2], "little")
-            off += 2
-            game_version = int.from_bytes(data[off:off+2], "little")
-            off += 2
-            compressed_len = int.from_bytes(data[off:off+2], "little")
-            off += 2
-
-            if compressed_len <= 0 or len(data) < off + compressed_len:
-                return None
-
-            compressed_payload = data[off:off+compressed_len]
-            try:
-                inflated = zlib.decompress(compressed_payload)
-            except Exception:
-                try:
-                    inflated = zlib.decompress(compressed_payload[2:], -zlib.MAX_WBITS)
-                except Exception:
-                    return None
-
-            if len(inflated) < 1038:
-                inflated += b"\x00" * (1038 - len(inflated))
-
-            coff = 0
-
-            def read_bytes(n):
-                nonlocal coff
-                chunk = inflated[coff:coff+n]
-                coff += n
-                if len(chunk) < n:
-                    chunk += b"\x00" * (n - len(chunk))
-                return chunk
-
-            session_name = self._decode_null_terminated(read_bytes(44))
-            map_name = self._decode_null_terminated(read_bytes(32))
-            mods = self._decode_null_terminated(read_bytes(128))
-            map_url = self._decode_null_terminated(read_bytes(96))
-            motd = self._decode_null_terminated(read_bytes(128))
-
-            cur_players = (bitfield_bits & 0x3C) >> 2
-            max_players = (bitfield_bits & 0x3C0) >> 6
-            tps = (bitfield_bits & 0x7C00) >> 10
-            b_passworded = (bitfield_bits & 0x02) == 0x02
-            b_locked_down = (bitfield_bits & 0x8000) == 0x8000
-            cur_players = max(0, min(cur_players, 16))
-
-            players = []
-            for i in range(16):
-                uname = self._decode_null_terminated(read_bytes(33))
-                kills = read_bytes(1)[0]
-                deaths = read_bytes(1)[0]
-                team = read_bytes(1)[0]
-                score = int.from_bytes(read_bytes(2), "little", signed=True)
-                if i < cur_players:
-                    players.append({
-                        "id": f"P{i+1}",
-                        "name": uname if uname else f"Player{i+1}",
-                        "kills": kills,
-                        "deaths": deaths,
-                        "team": team,
-                        "score": score
-                    })
-
-            return {
-                "dataVersion": data_version,
-                "gameVersion": game_version,
-                "sessionName": session_name,
-                "mapName": map_name,
-                "mods": mods,
-                "mapUrl": map_url,
-                "motd": motd,
-                "players": players,
-                "curPlayers": cur_players,
-                "maxPlayers": max_players if max_players > 0 else max(cur_players, len(players)),
-                "bPassworded": b_passworded,
-                "bLockedDown": b_locked_down,
-                "tps": tps
-            }
-        except Exception:
-            return None
+        return parse_bz2_unconnected_pong_packet(data)
 
     def parse_raknet_frames(self, data):
-        try:
-            frames = []
-            offset = 4 # Skip ID(1) + Seq(3)
-            while offset < len(data):
-                flags = data[offset]
-                offset += 1
-                reliability = (flags >> 5) & 0x07
-                is_split = (flags & 0x10) != 0
-                
-                if offset + 2 > len(data): break
-                length_bits = (data[offset] << 8) | data[offset+1]
-                offset += 2
-                length_bytes = (length_bits + 7) // 8
-                
-                if reliability in [2, 3, 4]: offset += 3 # Reliable Message Number
-                if reliability in [1, 4]: offset += 4 # Sequencing Index (3) + Order Channel (1)
-                if reliability == 3: offset += 4 # Ordering Index (3) + Order Channel (1)
-                if is_split: offset += 10
-                
-                if offset + length_bytes > len(data): break
-                frames.append(data[offset : offset+length_bytes])
-                offset += length_bytes
-            return frames
-        except: return []
+        return parse_raknet_frames_packet(data)
 
     def patch_raknet_packet(self, pkt, new_rel_seq=None):
         if len(pkt) < 10: return pkt
@@ -1929,63 +2045,12 @@ class BZLobbyMonitor:
         direct_lobbies = {k: v for k, v in self.lobbies.items() if str(k).startswith("direct_")}
         
         for g in games:
-            lid = g.get("g") # GUID
-            if not lid: continue
-            
-            # Decode Name (Base64)
-            raw_name = g.get("n") or ""
-            try:
-                raw_name += "=" * ((4 - len(raw_name) % 4) % 4)
-                decoded = base64.b64decode(raw_name)
-                name_bytes = decoded.split(b'\x00')[0]
-                name = name_bytes.decode('utf-8', errors='replace')
-            except:
-                name = raw_name
-                
-            map_name = g.get("m", "Unknown")
-            
-            users = {}
-            players = g.get("pl") or []
-            for p in players:
-                pid = p.get("i", "Unknown")
-                p_raw = p.get("n") or ""
-                try:
-                    p_raw += "=" * ((4 - len(p_raw) % 4) % 4)
-                    p_decoded = base64.b64decode(p_raw)
-                    p_name = p_decoded.split(b'\x00')[0].decode('utf-8', errors='replace')
-                except:
-                    p_name = p_raw
-                users[pid] = {"name": p_name, "id": pid, "team": p.get("t"), "score": p.get("s")}
-            
-            lobby = {
-                "id": lid,
-                "metadata": {
-                    "name": name, 
-                    "gameType": "BZCC", 
-                    "map": map_name, 
-                    "gameSettings": f"*{map_name}*", 
-                    "ready": f"*{map_name}*",
-                    "version": g.get("v", "?"),
-                    "typeId": g.get("gt", 0),
-                    "stateId": g.get("si", 0),
-                    "maxPlayers": g.get("pm", 0),
-                    # Additional lobbyServer telemetry (some labels inferred from legacy protocol usage)
-                    "gameTimeMinutes": g.get("gtm"),
-                    "typeDetailId": g.get("gtd"),
-                    "pingMs": g.get("pg"),
-                    "maxPingMs": g.get("pgm"),
-                    "modsCrc": g.get("d"),
-                    "natType": g.get("t"),
-                    "mapModCrc": g.get("mm"),
-                    "tps": g.get("tps")
-                },
-                "users": users,
-                "memberLimit": g.get("pm", 0),
-                "isLocked": str(g.get("l")) == "1",
-                "isPrivate": str(g.get("k")) == "1",
-                "owner": users[next(iter(users))]["id"] if users else "Unknown"
-            }
-            new_lobbies[str(lid)] = lobby
+            built = build_bzcc_lobby(g)
+            if not built:
+                continue
+
+            lid, lobby = built
+            new_lobbies[lid] = self.mark_lobby_seen(lobby, "BZCC HTTP")
             
         # Preserve live direct RakNet-discovered entries alongside HTTP list data.
         for lid, lobby in direct_lobbies.items():
@@ -2165,6 +2230,8 @@ class BZLobbyMonitor:
             new_lobbies = data.get("lobbies", {})
         else:
             new_lobbies = data
+        for _, lobby in new_lobbies.items():
+            self.mark_lobby_seen(lobby, "BZR WS")
         self.lobbies = new_lobbies
 
         # Cache any user snapshots piggy-backed in lobby payloads.
@@ -2197,7 +2264,7 @@ class BZLobbyMonitor:
                 
             if str(lid) not in self.lobbies:
                 self.trigger_alert("new_lobby")
-            self.lobbies[str(lid)] = lobby
+            self.lobbies[str(lid)] = self.mark_lobby_seen(lobby, "BZR WS")
 
             users = lobby.get("users", {})
             if isinstance(users, dict):
@@ -2476,6 +2543,8 @@ class BZLobbyMonitor:
             enabled = data.get("enabled")
         status_str = "unknown" if enabled is None else ("enabled" if enabled else "disabled")
         self.log(f"Relay Status Updated: {status_str}")
+        self.root.after(0, self.refresh_tree)
+        self.root.after(0, lambda: self.on_lobby_select(None))
         
     def set_lobby_metadata(self, lobby_id):
         # Set default metadata for created lobbies (similar to ChatManager.js)
@@ -2528,23 +2597,14 @@ class BZLobbyMonitor:
             
         # Repopulate
         friends = self.config.get("friend_list", "").lower().splitlines()
+        relay_enabled = self.get_relay_enabled_flag()
+        now = datetime.now()
         for lid, lobby in self.lobbies.items():
             meta = lobby.get("metadata", {})
-            raw_name = meta.get("name", "Unknown")
+            name = clean_lobby_name(meta.get("name", "Unknown"))
             
-            # Clean up name display (remove ~chat~pub~~ prefix)
-            if "~~" in raw_name:
-                name = raw_name.split("~~")[-1]
-            else:
-                name = raw_name
-                
-            owner = lobby.get("owner", "Unknown")
-            if owner == -1: owner = "none"
-            
-            # Calculate player count
             users = lobby.get("users", {})
             
-            # Check for friends
             has_friend = False
             for uid, u_data in users.items():
                 u_name = u_data.get('name', '').lower()
@@ -2557,26 +2617,21 @@ class BZLobbyMonitor:
             
             player_count = f"{len(users)}/{lobby.get('memberLimit', '?')}"
             
-            game_type = meta.get("gameType", "?")
-            version = lobby.get("clientVersion", "?")
-            locked = "Yes" if lobby.get("isLocked") else "No"
-            is_private = "Yes" if lobby.get("isPrivate") else "No"
+            version = extract_lobby_version(lobby)
+            map_name = extract_map_name_from_metadata(meta)
+            source = get_lobby_source(lobby)
+            age = get_lobby_age_label(lobby, now=now)
+            status = ", ".join(get_lobby_status_flags(lobby, relay_status=relay_enabled, now=now)[:4]) or "Normal"
+            net = get_lobby_network_label(lobby)
             
-            # Parse Map Name
-            map_name = "?"
-            game_settings = meta.get("gameSettings", "")
-            ready = meta.get("ready", "")
-            
-            if ready:
-                parts = ready.split('*')
-                if len(parts) >= 2: map_name = parts[1]
-            elif game_settings:
-                parts = game_settings.split('*')
-                if len(parts) >= 2: map_name = parts[1]
-            if map_name == "unknown": map_name = "?"
-            
-            tags = ("friend",) if has_friend else ()
-            self.tree.insert("", "end", values=(lid, name, map_name, owner, player_count, game_type, version, locked, is_private), tags=tags)
+            tags = []
+            if has_friend:
+                tags.append("friend")
+            if is_lobby_stale(lobby, now=now):
+                tags.append("stale")
+            if str(meta.get("launched")) == "1":
+                tags.append("launched")
+            self.tree.insert("", "end", values=(lid, name, map_name, player_count, source, age, status, net, version), tags=tuple(tags))
 
         # Restore selection if possible
         if selected_id:
@@ -2588,6 +2643,7 @@ class BZLobbyMonitor:
     def on_lobby_select(self, event):
         selected_items = self.tree.selection()
         if not selected_items:
+            self.clear_player_meta()
             return
             
         lid = str(self.tree.item(selected_items[0])['values'][0])
@@ -2607,11 +2663,7 @@ class BZLobbyMonitor:
         # Check for cached image to display in label
         l_meta = lobby.get('metadata', {})
         game_settings = l_meta.get('gameSettings')
-        mod_id = None
-        if game_settings:
-             parts = game_settings.split('*')
-             if len(parts) > 3 and parts[3] not in ['0', '']:
-                 mod_id = parts[3]
+        mod_id = extract_workshop_mod_id(game_settings)
         
         if mod_id and mod_id in self.image_cache:
             self.preview_label.config(image=self.image_cache[mod_id], text="")
@@ -2619,9 +2671,16 @@ class BZLobbyMonitor:
             self.preview_label.config(text="Loading Preview...")
             if mod_id not in self.pending_fetches:
                 self.fetch_image(mod_id, is_mod=True)
+
+        self.update_lobby_badges(lobby)
+        last_seen = get_lobby_last_seen(lobby)
+        source = get_lobby_source(lobby)
         
         self.lobby_details_text.insert("end", f"Lobby ID: {lobby.get('id')}\n")
         self.lobby_details_text.insert("end", f"Name: {l_meta.get('name')}\n")
+        self.lobby_details_text.insert("end", f"Source: {source}\n")
+        if last_seen:
+            self.lobby_details_text.insert("end", f"Last Seen: {last_seen.strftime('%Y-%m-%d %H:%M:%S')} ({format_age(last_seen)} ago)\n")
         self.lobby_details_text.insert("end", f"Created: {lobby.get('createdTime')}\n")
         if lobby.get("owner") is not None:
             self.lobby_details_text.insert("end", f"Owner: {lobby.get('owner')}\n")
@@ -2686,12 +2745,10 @@ class BZLobbyMonitor:
         
         # Parse Game Settings from Lobby Metadata
         if game_settings:
-             parts = game_settings.split('*')
-             if len(parts) > 1:
-                 self.lobby_details_text.insert("end", f"Map: {parts[1]}\n")
-             if len(parts) > 3 and parts[3] not in ['0', '']:
-                 mod_id = parts[3]
-                         
+             map_name = extract_map_name_from_game_settings(game_settings, default=None)
+             if map_name:
+                 self.lobby_details_text.insert("end", f"Map: {map_name}\n")
+             if mod_id:
                  self.lobby_details_text.insert("end", f"Mod ID: {mod_id} (")
                  self.insert_link(self.lobby_details_text, "Workshop", f"https://steamcommunity.com/sharedfiles/filedetails/?id={mod_id}")
                  self.lobby_details_text.insert("end", ")\n")
@@ -2711,9 +2768,16 @@ class BZLobbyMonitor:
         self.lobby_details_text.config(state="disabled")
 
     def update_player_details(self, lobby):
-        self.player_details_text.config(state="normal")
-        self.player_details_text.delete("1.0", "end")
-        
+        selected_uid = None
+        selected = self.player_tree.selection()
+        if selected:
+            values = self.player_tree.item(selected[0]).get("values", [])
+            if len(values) > 1:
+                selected_uid = str(values[1])
+
+        for item in self.player_tree.get_children():
+            self.player_tree.delete(item)
+
         users = lobby.get("users", {})
         friends = self.config.get("friend_list", "").lower().splitlines()
         for uid, user in users.items():
@@ -2726,87 +2790,69 @@ class BZLobbyMonitor:
                 user_name = user_meta.get('name', 'Unknown')
                 
             is_friend = any(f.strip() in user_name.lower() or f.strip() in str(uid).lower() for f in friends if f.strip())
-            
-            self.player_details_text.insert("end", f" - {user_name} (ID: {uid})", "friend" if is_friend else "")
-            if is_friend:
-                self.player_details_text.insert("end", " [FRIEND]", "friend")
-            self.player_details_text.insert("end", "\n")
-            self.player_details_text.insert("end", f"   IP: {user.get('ipAddress')}\n")
-            self.player_details_text.insert("end", f"   Auth: {user.get('authType')}\n")
-            if user.get("clientVersion") is not None:
-                self.player_details_text.insert("end", f"   Client: {user.get('clientVersion')}\n")
-            if user.get("lobby") is not None:
-                self.player_details_text.insert("end", f"   Lobby: {user.get('lobby')}\n")
-            if user.get("isAdmin") is not None:
-                self.player_details_text.insert("end", f"   Admin: {user.get('isAdmin')}\n")
-            if user.get("isInLounge") is not None:
-                self.player_details_text.insert("end", f"   In Lounge: {user.get('isInLounge')}\n")
-            
-            # Geo Lookup
+
             ip = user.get('ipAddress')
+            geo = ""
             if ip and ip != "unknown":
-                geo = self.get_geo_info(ip)
-                if geo:
-                    self.player_details_text.insert("end", f"   Loc: {geo}\n")
-            
+                geo = self.get_geo_info(ip) or "Lookup..."
+
+            team = user_meta.get("team", user.get("team", ""))
+            score = user_meta.get("score", user.get("score", ""))
+            admin = "Yes" if user.get("isAdmin") else ""
+            status_bits = []
+            if user_meta.get("launched") == "1":
+                status_bits.append("Launched")
+            if user.get("isInLounge"):
+                status_bits.append("Lounge")
+            if uid in self.muted_users:
+                status_bits.append("Muted")
+            if uid.startswith("S") and uid[1:] == "76561198297657246":
+                status_bits.append("Griefer")
+            status = ", ".join(status_bits) if status_bits else "-"
+
+            tags = []
+            if is_friend:
+                tags.append("friend")
+            if user.get("isAdmin"):
+                tags.append("admin")
+            if uid.startswith("S") and uid[1:] == "76561198297657246":
+                tags.append("griefer")
+
+            self.player_tree.insert(
+                "",
+                "end",
+                values=(
+                    user_name,
+                    uid,
+                    user.get("authType", ""),
+                    ip or "",
+                    geo,
+                    team,
+                    score,
+                    admin,
+                    status,
+                ),
+                tags=tuple(tags),
+            )
+
             if uid.startswith('S'):
                 steam_id = uid[1:]
-                
-                if HAS_PIL:
-                    if steam_id in self.image_cache:
-                        self.player_details_text.image_create("end", image=self.image_cache[steam_id])
-                        self.player_details_text.insert("end", " ")
-                    elif steam_id not in self.pending_fetches:
-                        self.fetch_image(steam_id, is_mod=False)
-                
-                self.player_details_text.insert("end", "   Profile: ")
-                self.insert_link(self.player_details_text, f"{steam_id}", f"https://steamcommunity.com/profiles/{steam_id}")
-                
-                if steam_id == "76561198297657246":
-                    self.player_details_text.insert("end", " [KNOWN GRIEFER]", "griefer")
-                    
-                self.player_details_text.insert("end", "\n")
-            
-            # Extended User Info
-            if user_meta:
-                if 'team' in user_meta:
-                    self.player_details_text.insert("end", f"   Team: {user_meta['team']}\n")
-                if 'vehicle' in user_meta:
-                    self.player_details_text.insert("end", f"   Vehicle: {user_meta['vehicle']}\n")
-                
-                # Parse Ready String for Map info (often on host)
-                ready = user_meta.get('ready')
-                if ready:
-                    r_parts = ready.split('*')
-                    if len(r_parts) > 1:
-                        self.player_details_text.insert("end", f"   Ready Map: {r_parts[1]}\n")
-                if user_meta.get('launched') == "1":
-                    self.player_details_text.insert("end", f"   Status: Launched\n")
+                if HAS_PIL and steam_id not in self.image_cache and steam_id not in self.pending_fetches:
+                    self.fetch_image(steam_id, is_mod=False)
 
-                # Show remaining metadata keys to expose new server-side fields.
-                known_meta = {"team", "vehicle", "ready", "launched", "name"}
-                for mk in sorted(user_meta.keys()):
-                    if mk in known_meta:
-                        continue
-                    self.player_details_text.insert("end", f"   meta.{mk}: {self._fmt_compact_value(user_meta.get(mk))}\n")
-            
-            # Network Info
-            wan = user.get('wanAddress')
-            if wan and wan != 'unknown':
-                self.player_details_text.insert("end", f"   WAN: {wan}\n")
-            
-            lans = user.get('lanAddresses')
-            if lans:
-                if isinstance(lans, list):
-                    lan_str = ", ".join(lans)
-                else:
-                    lan_str = str(lans)
-                if lan_str:
-                    self.player_details_text.insert("end", f"   LAN: {lan_str}\n")
-            
-            self.player_details_text.insert("end", "-"*30 + "\n")
-            
-        self.player_details_text.config(state="disabled")
+        children = self.player_tree.get_children()
+        if children:
+            chosen = children[0]
+            if selected_uid:
+                for item in children:
+                    values = self.player_tree.item(item).get("values", [])
+                    if len(values) > 1 and str(values[1]) == selected_uid:
+                        chosen = item
+                        break
+            self.player_tree.selection_set(chosen)
+            self.on_player_select()
+        else:
+            self.clear_player_meta("No players in this lobby.")
 
     def fetch_image(self, target_id, is_mod):
         self.pending_fetches.add(target_id)
@@ -3116,56 +3162,102 @@ class BZLobbyMonitor:
 
     # --- Logging Tools ---
     def cleanup_logs(self):
-        retention = self.config.get("log_retention", 7)
-        # Implementation left simple: user can manually delete for now or expand later
-        pass
+        today = datetime.now().date()
+        if self.last_log_cleanup_day == today:
+            return
+
+        try:
+            retention = max(0, int(self.config.get("log_retention", 7)))
+        except (TypeError, ValueError):
+            retention = 7
+
+        folder = self.config.get("log_folder", "")
+        if not folder or not os.path.exists(folder):
+            folder = "."
+
+        cutoff = today - timedelta(days=retention)
+        for entry in os.scandir(folder):
+            if not entry.is_file():
+                continue
+
+            match = re.fullmatch(r"bzr_log_(\d{4}-\d{2}-\d{2})\.txt", entry.name)
+            if not match:
+                continue
+
+            try:
+                log_date = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+            except ValueError:
+                continue
+
+            if log_date < cutoff:
+                try:
+                    os.remove(entry.path)
+                except OSError:
+                    pass
+
+        self.last_log_cleanup_day = today
 
     def toggle_stats_logging(self):
         self.save_ui_config()
         if self.stats_enabled_var.get():
             self.start_stats_logger()
+        else:
+            self.stop_stats_logger()
         self.draw_stats()
 
     def start_stats_logger(self):
-        threading.Thread(target=self._stats_logger_loop, daemon=True).start()
+        if self.stats_thread and self.stats_thread.is_alive():
+            return
+
+        self.stats_stop_event.clear()
+        self.stats_thread = threading.Thread(target=self._stats_logger_loop, daemon=True)
+        self.stats_thread.start()
+
+    def stop_stats_logger(self):
+        self.stats_stop_event.set()
 
     def _stats_logger_loop(self):
-        while self.should_run and self.config.get("stats_enabled", False):
-            try:
-                if self.lobbies:
-                    filename = "bzr_stats.csv"
-                    file_exists = os.path.isfile(filename)
-                    
-                    with open(filename, "a", newline="", encoding="utf-8") as f:
-                        writer = csv.writer(f)
-                        if not file_exists:
-                            writer.writerow(["Timestamp", "LobbyID", "Name", "Map", "Players", "MaxPlayers", "Type"])
-                        
-                        timestamp = datetime.now().isoformat()
-                        for lid, lobby in self.lobbies.items():
-                            meta = lobby.get("metadata", {})
-                            users = lobby.get("users", {})
-                            
-                            # Parse map
-                            map_name = "?"
-                            if "ready" in meta: map_name = meta["ready"].split('*')[1] if '*' in meta["ready"] else "?"
-                            
-                            writer.writerow([
-                                timestamp,
-                                lid,
-                                meta.get("name", "Unknown"),
-                                map_name,
-                                len(users),
-                                lobby.get("memberLimit", 0),
-                                meta.get("gameType", "?")
-                            ])
-            except Exception as e:
-                print(f"Stats log error: {e}")
-            
-            # Log every 60 seconds
-            for _ in range(60):
-                if not self.should_run or not self.config.get("stats_enabled", False): return
-                time.sleep(1)
+        try:
+            while self.should_run and self.config.get("stats_enabled", False) and not self.stats_stop_event.is_set():
+                try:
+                    if self.lobbies:
+                        filename = "bzr_stats.csv"
+                        file_exists = os.path.isfile(filename)
+
+                        with open(filename, "a", newline="", encoding="utf-8") as f:
+                            writer = csv.writer(f)
+                            if not file_exists:
+                                writer.writerow(["Timestamp", "LobbyID", "Name", "Map", "Players", "MaxPlayers", "Type"])
+
+                            timestamp = datetime.now().isoformat()
+                            for lid, lobby in self.lobbies.items():
+                                meta = lobby.get("metadata", {})
+                                users = lobby.get("users", {})
+
+                                map_name = "?"
+                                if "ready" in meta:
+                                    map_name = meta["ready"].split('*')[1] if '*' in meta["ready"] else "?"
+
+                                writer.writerow([
+                                    timestamp,
+                                    lid,
+                                    meta.get("name", "Unknown"),
+                                    map_name,
+                                    len(users),
+                                    lobby.get("memberLimit", 0),
+                                    meta.get("gameType", "?")
+                                ])
+                except Exception as e:
+                    print(f"Stats log error: {e}")
+
+                for _ in range(60):
+                    if (not self.should_run or
+                        not self.config.get("stats_enabled", False) or
+                        self.stats_stop_event.is_set()):
+                        return
+                    time.sleep(1)
+        finally:
+            self.stats_thread = None
 
     # --- Discord Integration ---
     def toggle_discord_relay(self):
@@ -3175,22 +3267,28 @@ class BZLobbyMonitor:
                 self.discord_thread = threading.Thread(target=self.discord_polling_loop, daemon=True)
                 self.discord_thread.start()
                 self.log("Discord Relay Started.")
+
+    def fetch_discord_bot_identity(self, token):
+        req = urllib.request.Request("https://discord.com/api/v10/users/@me")
+        req.add_header("Authorization", f"Bot {token}")
+        req.add_header("User-Agent", "BZLobbyMonitor/1.0")
+
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode('utf-8'))
+
+        self.discord_bot_id = data.get("id")
+        self.discord_bot_token = token
+        return data
         
     def test_discord_connection(self):
         token = self.discord_token_var.get()
         if not token: return
         
         try:
-            req = urllib.request.Request("https://discord.com/api/v10/users/@me")
-            req.add_header("Authorization", f"Bot {token}")
-            req.add_header("User-Agent", "BZLobbyMonitor/1.0")
-            
-            with urllib.request.urlopen(req) as r:
-                data = json.loads(r.read().decode('utf-8'))
-                self.discord_bot_id = data.get("id")
-                username = data.get("username")
-                messagebox.showinfo("Success", f"Connected as {username} (ID: {self.discord_bot_id})")
-                self.log(f"Discord Bot Authenticated: {username}")
+            data = self.fetch_discord_bot_identity(token)
+            username = data.get("username")
+            messagebox.showinfo("Success", f"Connected as {username} (ID: {self.discord_bot_id})")
+            self.log(f"Discord Bot Authenticated: {username}")
         except Exception as e:
             messagebox.showerror("Error", f"Discord Connection Failed:\n{e}")
 
@@ -3210,7 +3308,7 @@ class BZLobbyMonitor:
                 req.add_header("Authorization", f"Bot {token}")
                 req.add_header("Content-Type", "application/json")
                 req.add_header("User-Agent", "BZLobbyMonitor/1.0")
-                with urllib.request.urlopen(req) as r: pass
+                with urllib.request.urlopen(req, timeout=10) as r: pass
             except Exception as e:
                 print(f"Discord Send Error: {e}")
         threading.Thread(target=_send, daemon=True).start()
@@ -3228,19 +3326,11 @@ class BZLobbyMonitor:
         if not lobby: return
         
         meta = lobby.get("metadata", {})
-        name = meta.get("name", "Unknown Lobby")
-        if "~~" in name: name = name.split("~~")[-1]
+        name = clean_lobby_name(meta.get("name", "Unknown Lobby"), default="Unknown Lobby")
         
         users = lobby.get("users", {})
         player_count = f"{len(users)}/{lobby.get('memberLimit', '?')}"
-        
-        map_name = "Unknown"
-        if "ready" in meta:
-            parts = meta["ready"].split('*')
-            if len(parts) >= 2: map_name = parts[1]
-        elif "gameSettings" in meta:
-            parts = meta["gameSettings"].split('*')
-            if len(parts) >= 2: map_name = parts[1]
+        map_name = extract_map_name_from_metadata(meta, default="Unknown")
             
         embed = {
             "title": f"🎮 {name}",
@@ -3271,14 +3361,18 @@ class BZLobbyMonitor:
             token = self.discord_token_var.get()
             chan_id = self.discord_channel_id_var.get()
             if token and chan_id:
+                if token != self.discord_bot_token or not self.discord_bot_id:
+                    self.fetch_discord_bot_identity(token)
+
                 url = f"https://discord.com/api/v10/channels/{chan_id}/messages?limit=1"
                 req = urllib.request.Request(url)
                 req.add_header("Authorization", f"Bot {token}")
                 req.add_header("User-Agent", "BZLobbyMonitor/1.0")
-                with urllib.request.urlopen(req) as r:
+                with urllib.request.urlopen(req, timeout=10) as r:
                     msgs = json.loads(r.read().decode('utf-8'))
                     if msgs: last_id = msgs[0].get("id")
-        except: pass
+        except Exception as e:
+            self.warn(f"Discord relay initialization failed: {e}")
 
         while self.should_run and self.discord_enabled_var.get():
             try:
@@ -3287,6 +3381,14 @@ class BZLobbyMonitor:
                 if not token or not chan_id:
                     time.sleep(5)
                     continue
+
+                if token != self.discord_bot_token or not self.discord_bot_id:
+                    try:
+                        self.fetch_discord_bot_identity(token)
+                    except Exception as e:
+                        self.warn(f"Discord bot identity refresh failed: {e}")
+                        time.sleep(5)
+                        continue
                 
                 url = f"https://discord.com/api/v10/channels/{chan_id}/messages?limit=5"
                 if last_id:
@@ -3296,7 +3398,7 @@ class BZLobbyMonitor:
                 req.add_header("Authorization", f"Bot {token}")
                 req.add_header("User-Agent", "BZLobbyMonitor/1.0")
                 
-                with urllib.request.urlopen(req) as r:
+                with urllib.request.urlopen(req, timeout=10) as r:
                     msgs = json.loads(r.read().decode('utf-8'))
                     
                     # Process from oldest to newest
@@ -3305,17 +3407,24 @@ class BZLobbyMonitor:
                         author = m.get("author", {})
                         author_id = author.get("id")
                         content = m.get("content", "")
+                        if m.get("webhook_id") or not content:
+                            last_id = msg_id
+                            continue
                         
-                        if last_id and author_id != self.discord_bot_id:
-                            if self.discord_to_lobby_var.get() and self.connected:
-                                target_lobby = self.discord_lobby_id_var.get()
-                                if str(self.current_lobby_id) == str(target_lobby):
-                                    sender = author.get("username")
-                                    chat_line = f"[Discord] {sender}: {content}"
-                                    self.ws.send(json.dumps({"type": "DoSendChat", "content": chat_line}))
+                        chat_line = should_relay_discord_message(
+                            m,
+                            bot_id=self.discord_bot_id,
+                            relay_to_lobby_enabled=self.discord_to_lobby_var.get(),
+                            connected=self.connected,
+                            current_lobby_id=self.current_lobby_id,
+                            target_lobby_id=self.discord_lobby_id_var.get(),
+                        )
+                        if last_id and chat_line:
+                            self.ws.send(json.dumps({"type": "DoSendChat", "content": chat_line}))
                         
                         last_id = msg_id
-            except Exception as e: pass
+            except Exception as e:
+                self.warn(f"Discord relay polling error: {e}")
             time.sleep(2)
 
     # --- Bot & RPC & Stats ---
@@ -3372,8 +3481,7 @@ class BZLobbyMonitor:
         found = False
         for lid, lobby in self.lobbies.items():
             meta = lobby.get("metadata", {})
-            raw_name = meta.get("name", "")
-            clean_name = raw_name.split("~~")[-1] if "~~" in raw_name else raw_name
+            clean_name = clean_lobby_name(meta.get("name", ""), default="")
             if clean_name.lower() == target_name.lower():
                 found = True
                 break
@@ -3396,14 +3504,18 @@ class BZLobbyMonitor:
         
         def _fetch():
             try:
-                with urllib.request.urlopen(f"http://ip-api.com/json/{ip}?fields=status,countryCode,timezone,offset") as r:
+                with urllib.request.urlopen(f"http://ip-api.com/json/{ip}?fields=status,countryCode,timezone,offset", timeout=5) as r:
                     data = json.loads(r.read().decode())
                     if data.get("status") == "success":
                         info = f"[{data.get('countryCode')}] {data.get('timezone')}"
                         self.geo_cache[ip] = info
+                        self.geo_lookup_failures.discard(ip)
                         # Refresh UI if this player is currently shown
                         self.root.after(0, lambda: self.on_lobby_select(None))
-            except: pass
+            except Exception as e:
+                if ip not in self.geo_lookup_failures:
+                    self.geo_lookup_failures.add(ip)
+                    self.warn(f"Geo lookup failed for {ip}: {e}")
         
         threading.Thread(target=_fetch, daemon=True).start()
         return None
@@ -3431,7 +3543,11 @@ class BZLobbyMonitor:
         if self.rpc and self.config.get("rpc_enabled", False):
             try:
                 self.rpc.update(state=state, details=details, large_image="bz98_icon", large_text="Battlezone 98 Redux")
-            except: pass
+                self.rpc_update_error_logged = False
+            except Exception as e:
+                if not self.rpc_update_error_logged:
+                    self.rpc_update_error_logged = True
+                    self.warn(f"Discord RPC update failed: {e}")
 
     def draw_stats(self):
         self.stats_canvas.delete("all")
@@ -3449,29 +3565,18 @@ class BZLobbyMonitor:
             self.stats_canvas.create_text(w/2, h/2, text="No stats data found.", fill="white")
             return
             
-        data_points = {} # timestamp -> total_players
-        
+        rows = []
         try:
             with open(filename, "r", encoding="utf-8") as f:
                 reader = csv.reader(f)
                 next(reader, None) # Skip header
-                for row in reader:
-                    if len(row) < 5: continue
-                    ts_str = row[0]
-                    try:
-                        dt = datetime.fromisoformat(ts_str)
-                        # Filter last 24h
-                        if datetime.now() - dt > timedelta(hours=24): continue
-                        players = int(row[4])
-                        # Sum players per snapshot (each snapshot = one exact ISO timestamp)
-                        if ts_str not in data_points: data_points[ts_str] = 0
-                        data_points[ts_str] += players
-                    except: pass
-        except: pass
+                rows = list(reader)
+        except Exception as e:
+            self.warn(f"Failed to read stats file '{filename}': {e}")
+
+        sorted_pts = aggregate_recent_player_counts(rows, now=datetime.now())
         
-        if not data_points: return
-        
-        sorted_pts = sorted([(datetime.fromisoformat(k), v) for k, v in data_points.items()], key=lambda x: x[0])
+        if not sorted_pts: return
         
         max_p = max([p[1] for p in sorted_pts]) if sorted_pts else 10
         if max_p == 0: max_p = 10
@@ -3557,278 +3662,10 @@ class BZLobbyMonitor:
         except Exception as e:
             self.log(f"HTTP Poll Failed: {e}")
 
-if __name__ == "__main__":
+def main():
     root = tk.Tk()
     app = BZLobbyMonitor(root)
     root.mainloop()
-        
-    def test_discord_connection(self):
-        token = self.discord_token_var.get()
-        if not token: return
-        
-        try:
-            req = urllib.request.Request("https://discord.com/api/v10/users/@me")
-            req.add_header("Authorization", f"Bot {token}")
-            req.add_header("User-Agent", "BZLobbyMonitor/1.0")
-            
-            with urllib.request.urlopen(req) as r:
-                data = json.loads(r.read().decode('utf-8'))
-                self.discord_bot_id = data.get("id")
-                username = data.get("username")
-                messagebox.showinfo("Success", f"Connected as {username} (ID: {self.discord_bot_id})")
-                self.log(f"Discord Bot Authenticated: {username}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Discord Connection Failed:\n{e}")
-
-    def send_to_discord(self, message=None, embed=None):
-        token = self.discord_token_var.get()
-        chan_id = self.discord_channel_id_var.get()
-        if not token or not chan_id: return
-        
-        def _send():
-            try:
-                url = f"https://discord.com/api/v10/channels/{chan_id}/messages"
-                payload = {}
-                if message: payload["content"] = message
-                if embed: payload["embeds"] = [embed]
-                data = json.dumps(payload).encode('utf-8')
-                req = urllib.request.Request(url, data=data, method="POST")
-                req.add_header("Authorization", f"Bot {token}")
-                req.add_header("Content-Type", "application/json")
-                req.add_header("User-Agent", "BZLobbyMonitor/1.0")
-                with urllib.request.urlopen(req) as r: pass
-            except Exception as e:
-                print(f"Discord Send Error: {e}")
-        threading.Thread(target=_send, daemon=True).start()
-
-    def post_lobby_status(self):
-        if self.current_lobby_id is None:
-            messagebox.showinfo("Info", "Not in a lobby.")
-            return
-            
-        lobby = self.lobbies.get(str(self.current_lobby_id))
-        if not lobby: return
-        
-        meta = lobby.get("metadata", {})
-        name = meta.get("name", "Unknown Lobby")
-        if "~~" in name: name = name.split("~~")[-1]
-        
-        users = lobby.get("users", {})
-        player_count = f"{len(users)}/{lobby.get('memberLimit', '?')}"
-        
-        map_name = "Unknown"
-        if "ready" in meta:
-            parts = meta["ready"].split('*')
-            if len(parts) >= 2: map_name = parts[1]
-        elif "gameSettings" in meta:
-            parts = meta["gameSettings"].split('*')
-            if len(parts) >= 2: map_name = parts[1]
-            
-        embed = {
-            "title": f"🎮 {name}",
-            "color": 0x00ff00,
-            "fields": [
-                {"name": "Map", "value": map_name, "inline": True},
-                {"name": "Players", "value": player_count, "inline": True},
-                {"name": "ID", "value": str(self.current_lobby_id), "inline": True}
-            ],
-            "footer": {"text": f"Battlezone Lobby Monitor • {datetime.now().strftime('%H:%M')}"}
-        }
-        
-        # Add join link if host is steam
-        owner_id = str(lobby.get("owner", ""))
-        if owner_id.startswith('S'):
-            steam_id = owner_id[1:]
-            url = f"steam://rungame/301650/{steam_id}/+connect_lobby=B{self.current_lobby_id}"
-            embed["description"] = f"[**Click to Join via Steam**]({url})"
-            
-        self.send_to_discord(embed=embed)
-        self.log("Posted lobby status to Discord.")
-
-    def discord_polling_loop(self):
-        last_id = None
-        
-        # Initial fetch to get the latest message ID so we don't spam old messages
-        try:
-            token = self.discord_token_var.get()
-            chan_id = self.discord_channel_id_var.get()
-            if token and chan_id:
-                url = f"https://discord.com/api/v10/channels/{chan_id}/messages?limit=1"
-                req = urllib.request.Request(url)
-                req.add_header("Authorization", f"Bot {token}")
-                req.add_header("User-Agent", "BZLobbyMonitor/1.0")
-                with urllib.request.urlopen(req) as r:
-                    msgs = json.loads(r.read().decode('utf-8'))
-                    if msgs: last_id = msgs[0].get("id")
-        except: pass
-
-        while self.should_run and self.discord_enabled_var.get():
-            try:
-                token = self.discord_token_var.get()
-                chan_id = self.discord_channel_id_var.get()
-                if not token or not chan_id:
-                    time.sleep(5)
-                    continue
-                
-                url = f"https://discord.com/api/v10/channels/{chan_id}/messages?limit=5"
-                if last_id:
-                    url += f"&after={last_id}"
-                
-                req = urllib.request.Request(url)
-                req.add_header("Authorization", f"Bot {token}")
-                req.add_header("User-Agent", "BZLobbyMonitor/1.0")
-                
-                with urllib.request.urlopen(req) as r:
-                    msgs = json.loads(r.read().decode('utf-8'))
-                    
-                    # Process from oldest to newest
-                    for m in reversed(msgs):
-                        msg_id = m.get("id")
-                        author = m.get("author", {})
-                        author_id = author.get("id")
-                        content = m.get("content", "")
-                        
-                        if last_id and author_id != self.discord_bot_id:
-                            if self.discord_to_lobby_var.get() and self.connected:
-                                target_lobby = self.discord_lobby_id_var.get()
-                                if str(self.current_lobby_id) == str(target_lobby):
-                                    sender = author.get("username")
-                                    chat_line = f"[Discord] {sender}: {content}"
-                                    self.ws.send(json.dumps({"type": "DoSendChat", "content": chat_line}))
-                        
-                        last_id = msg_id
-            except Exception as e: pass
-            time.sleep(2)
-
-    # --- Bot & RPC & Stats ---
-    def start_bot_loop(self):
-        threading.Thread(target=self.bot_loop, daemon=True).start()
-
-    def bot_loop(self):
-        while self.should_run:
-            if self.config.get("bot_announce_enabled", False) and self.connected and self.current_lobby_id is not None:
-                interval = self.config.get("bot_announce_interval", 5) * 60
-                if time.time() - self.last_announce_time > interval:
-                    msg = self.config.get("bot_announce_msg", "")
-                    if msg:
-                        self.send_chat_message(msg)
-                        self.last_announce_time = time.time()
-            time.sleep(10)
-
-    def get_geo_info(self, ip):
-        if ip in self.geo_cache: return self.geo_cache[ip]
-        
-        def _fetch():
-            try:
-                with urllib.request.urlopen(f"http://ip-api.com/json/{ip}?fields=status,countryCode,timezone,offset") as r:
-                    data = json.loads(r.read().decode())
-                    if data.get("status") == "success":
-                        offset = data.get('offset', 0)
-                        hours = int(offset / 3600)
-                        minutes = int((abs(offset) % 3600) / 60)
-                        utc_str = f"UTC{'+' if hours >= 0 else ''}{hours}:{minutes:02d}"
-                        info = f"[{data.get('countryCode')}] {data.get('timezone')} ({utc_str})"
-                        self.geo_cache[ip] = info
-                        # Refresh UI if this player is currently shown
-                        self.root.after(0, lambda: self.on_lobby_select(None))
-            except: pass
-        
-        threading.Thread(target=_fetch, daemon=True).start()
-        return None
-
-    def init_rpc(self):
-        if not HAS_RPC: return
-        try:
-            client_id = self.config.get("rpc_client_id", "133570000000000000")
-            self.rpc = Presence(client_id)
-            self.rpc.connect()
-            self.log("Discord RPC Connected.")
-        except Exception as e:
-            self.log(f"RPC Error: {e}")
-
-    def toggle_rpc(self):
-        self.save_ui_config()
-        if self.rpc_enabled_var.get():
-            if not self.rpc: self.init_rpc()
-        else:
-            if self.rpc: 
-                self.rpc.close()
-                self.rpc = None
-
-    def update_rpc(self, state, details):
-        if self.rpc and self.config.get("rpc_enabled", False):
-            try:
-                self.rpc.update(state=state, details=details, large_image="bz98_icon", large_text="Battlezone 98 Redux")
-            except: pass
-
-    def draw_stats(self):
-        self.stats_canvas.delete("all")
-        w = self.stats_canvas.winfo_width()
-        h = self.stats_canvas.winfo_height()
-        if w < 50: return
-        
-        filename = "bzr_stats.csv"
-        if not os.path.exists(filename):
-            self.stats_canvas.create_text(w/2, h/2, text="No stats data found.", fill="white")
-            return
-            
-        data_points = {} # timestamp -> total_players
-        
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                next(reader, None) # Skip header
-                for row in reader:
-                    if len(row) < 5: continue
-                    ts_str = row[0]
-                    try:
-                        dt = datetime.fromisoformat(ts_str)
-                        # Filter last 24h
-                        if datetime.now() - dt > timedelta(hours=24): continue
-                        
-                        players = int(row[4])
-                        
-                        # Group by minute to reduce noise
-                        # Since CSV has one row per lobby, we need to sum them for the same timestamp
-                        # But timestamps are exact per snapshot. 
-                        # We can assume unique timestamps per snapshot.
-                        # Actually, let's just take the max players seen in a 5-min window?
-                        # Simpler: Just plot raw points.
-                        # Better: Group by snapshot. A snapshot shares the exact ISO string.
-                        if ts_str not in data_points: data_points[ts_str] = 0
-                        data_points[ts_str] += players
-                    except: pass
-        except: pass
-        
-        if not data_points: return
-        
-        sorted_pts = sorted([(datetime.fromisoformat(k), v) for k, v in data_points.items()], key=lambda x: x[0])
-        
-        max_p = max([p[1] for p in sorted_pts]) if sorted_pts else 10
-        if max_p == 0: max_p = 10
-        
-        # Draw
-        pad = 40
-        prev_x, prev_y = None, None
-        start_time = sorted_pts[0][0]
-        total_seconds = (sorted_pts[-1][0] - start_time).total_seconds()
-        if total_seconds == 0: total_seconds = 1
-        
-        for dt, count in sorted_pts:
-            secs = (dt - start_time).total_seconds()
-            x = pad + (secs / total_seconds) * (w - 2*pad)
-            y = h - pad - (count / max_p) * (h - 2*pad)
-            
-            if prev_x is not None:
-                self.stats_canvas.create_line(prev_x, prev_y, x, y, fill=self.colors["highlight"], width=2)
-            prev_x, prev_y = x, y
-            
-        self.stats_canvas.create_text(pad, h-pad+15, text=start_time.strftime("%H:%M"), fill="gray", anchor="w")
-        self.stats_canvas.create_text(w-pad, h-pad+15, text=sorted_pts[-1][0].strftime("%H:%M"), fill="gray", anchor="e")
-        self.stats_canvas.create_text(pad-5, pad, text=str(max_p), fill="gray", anchor="e")
-        self.stats_canvas.create_text(pad-5, h-pad, text="0", fill="gray", anchor="e")
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = BZLobbyMonitor(root)
-    root.mainloop()
+    main()
