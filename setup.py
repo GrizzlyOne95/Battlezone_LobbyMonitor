@@ -13,14 +13,14 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="bzr-monitor",
-    version="1.0.0",
+    version="1.2.1",
     author="GrizzlyOne95",
     description="A comprehensive external tool for monitoring Battlezone 98 Redux lobbies",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/GrizzlyOne95/Battlezone_LobbyMonitor",
     packages=find_packages(),
-    py_modules=["bzr_monitor"],
+    py_modules=["bzr_monitor", "bzr_monitor_utils"],
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
