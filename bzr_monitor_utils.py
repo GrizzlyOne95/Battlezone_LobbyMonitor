@@ -233,6 +233,8 @@ def build_bzcc_lobby(game):
         return None
 
     map_name = game.get("m", "Unknown")
+    passworded = str(game.get("k")) == "1"
+    mod_list = game.get("mm")
     users = {}
     for player in game.get("pl") or []:
         pid = player.get("i", "Unknown")
@@ -241,6 +243,10 @@ def build_bzcc_lobby(game):
             "id": pid,
             "team": player.get("t"),
             "score": player.get("s"),
+            "metadata": {
+                "kills": player.get("k"),
+                "deaths": player.get("d"),
+            },
         }
 
     lobby = {
@@ -260,14 +266,17 @@ def build_bzcc_lobby(game):
             "pingMs": game.get("pg"),
             "maxPingMs": game.get("pgm"),
             "modsCrc": game.get("d"),
+            "modList": mod_list,
             "natType": game.get("t"),
             "mapModCrc": game.get("mm"),
+            "hostMessage": game.get("h", ""),
+            "passwordProtected": passworded,
             "tps": game.get("tps"),
         },
         "users": users,
         "memberLimit": game.get("pm", 0),
-        "isLocked": str(game.get("l")) == "1",
-        "isPrivate": str(game.get("k")) == "1",
+        "isLocked": passworded,
+        "isPrivate": str(game.get("l")) == "1",
         "owner": users[next(iter(users))]["id"] if users else "Unknown",
     }
     return str(lid), lobby

@@ -1288,9 +1288,166 @@ class BZLobbyMonitor:
             l.sort(reverse=reverse)
 
         for index, (val, k) in enumerate(l):
-            self.tree.move(k, "", index)
+            self.tree.move(k, '', index)
 
         self.tree.heading(col, command=lambda: self.sort_tree(col, not reverse))
+
+    def sort_player_tree(self, col, reverse):
+        rows = [(self.player_tree.set(k, col), k) for k in self.player_tree.get_children('')]
+        try:
+            rows.sort(key=lambda t: int(t[0]) if str(t[0]).lstrip("-").isdigit() else str(t[0]).lower(), reverse=reverse)
+        except ValueError:
+            rows.sort(key=lambda t: str(t[0]).lower(), reverse=reverse)
+
+        for index, (_, item_id) in enumerate(rows):
+            self.player_tree.move(item_id, '', index)
+
+        self.player_tree.heading(col, command=lambda: self.sort_player_tree(col, not reverse))
+
+    def get_relay_enabled_flag(self):
+        if isinstance(self.last_relay_status, dict):
+            return self.last_relay_status.get("enabled")
+        return None
+
+    def mark_lobby_seen(self, lobby, source):
+        if isinstance(lobby, dict):
+            stamp_lobby(lobby, source)
+        return lobby
+
+    def set_lobby_badge(self, key, text, fg=None, bg=None):
+        label = self.lobby_badges.get(key)
+        if not label:
+            return
+        label.config(
+            text=text,
+            fg=fg or self.colors["fg"],
+            bg=bg or "#1a1a1a",
+        )
+
+    def update_lobby_badges(self, lobby):
+        relay_enabled = self.get_relay_enabled_flag()
+        source = get_lobby_source(lobby, default="Source: ?")
+        age_text = get_lobby_age_label(lobby, default="?")
+        last_seen = get_lobby_last_seen(lobby)
+        freshness_text = f"Seen {age_text}"
+        if last_seen:
+            freshness_text = f"{freshness_text} ago"
+        is_stale = is_lobby_stale(lobby)
+        network_text = get_lobby_network_label(lobby, default="-")
+        status_flags = get_lobby_status_flags(lobby, relay_status=relay_enabled)
+        relay_text = "Relay ?" if relay_enabled is None else ("Relay On" if relay_enabled else "Relay Off")
+
+        self.set_lobby_badge("source", source, bg="#15313a")
+        self.set_lobby_badge("freshness", freshness_text, bg="#3a2f15" if is_stale else "#153a20")
+        self.set_lobby_badge("state", " | ".join(status_flags[:3]) if status_flags else "State: Normal", bg="#2a1f3a")
+        self.set_lobby_badge("network", network_text, bg="#1f1f3a")
+        relay_bg = "#2a2a2a" if relay_enabled is None else ("#203a35" if relay_enabled else "#3a2020")
+        self.set_lobby_badge("relay", relay_text, bg=relay_bg)
+
+    def start_periodic_ui_refresh(self):
+        self.root.after(5000, self._periodic_ui_refresh)
+
+    def _periodic_ui_refresh(self):
+        if not self.root.winfo_exists():
+            return
+        try:
+            if self.lobbies:
+                self.refresh_tree()
+                self.on_lobby_select(None)
+        finally:
+            if self.root.winfo_exists():
+                self.root.after(5000, self._periodic_ui_refresh)
+
+    def clear_player_meta(self, message="Select a player for details."):
+        self.player_meta_text.config(state="normal")
+        self.player_meta_text.delete("1.0", "end")
+        self.player_meta_text.insert("end", message)
+        self.player_meta_text.config(state="disabled")
+
+    def get_selected_player_context(self):
+        selected = self.player_tree.selection()
+        if not selected:
+            return None, None
+
+        uid = str(self.player_tree.item(selected[0])["values"][1])
+        if self.current_lobby_id is None:
+            return uid, None
+
+        lobby = self.lobbies.get(str(self.current_lobby_id))
+        if not lobby:
+            return uid, None
+
+        user = lobby.get("users", {}).get(uid)
+        if user is None:
+            for alt_uid, alt_user in lobby.get("users", {}).items():
+                if str(alt_uid) == uid:
+                    user = alt_user
+                    uid = str(alt_uid)
+                    break
+        return uid, user
+
+    def on_player_select(self, event=None):
+        uid, user = self.get_selected_player_context()
+        if uid is None or user is None:
+            self.clear_player_meta()
+            return
+        self.render_selected_player_meta(uid, user)
+
+    def render_selected_player_meta(self, uid, user):
+        user = self.get_enriched_user(uid, user)
+        user_meta = user.get("metadata", {}) if isinstance(user, dict) else {}
+        ip = user.get("ipAddress")
+        geo = self.get_geo_info(ip) if ip and ip != "unknown" else None
+
+        self.player_meta_text.config(state="normal")
+        self.player_meta_text.delete("1.0", "end")
+        self.player_meta_text.insert("end", f"Name: {user.get('name', 'Unknown')}\n")
+        self.player_meta_text.insert("end", f"ID: {uid}\n")
+        self.player_meta_text.insert("end", f"Auth: {user.get('authType', '')}\n")
+        self.player_meta_text.insert("end", f"IP: {ip or ''}\n")
+        if geo:
+            self.player_meta_text.insert("end", f"Geo: {geo}\n")
+        if user.get("clientVersion") is not None:
+            self.player_meta_text.insert("end", f"Client: {user.get('clientVersion')}\n")
+        if user.get("isAdmin") is not None:
+            self.player_meta_text.insert("end", f"Admin: {user.get('isAdmin')}\n")
+        if user.get("isInLounge") is not None:
+            self.player_meta_text.insert("end", f"In Lounge: {user.get('isInLounge')}\n")
+        if user.get("wanAddress") and user.get("wanAddress") != "unknown":
+            self.player_meta_text.insert("end", f"WAN: {user.get('wanAddress')}\n")
+        lans = user.get("lanAddresses")
+        if lans:
+            lan_text = ", ".join(lans) if isinstance(lans, list) else str(lans)
+            self.player_meta_text.insert("end", f"LAN: {lan_text}\n")
+        if user.get("lobby") is not None:
+            self.player_meta_text.insert("end", f"Lobby: {user.get('lobby')}\n")
+        team = user_meta.get("team", user.get("team"))
+        if team not in [None, ""]:
+            self.player_meta_text.insert("end", f"Team: {team}\n")
+        score = user_meta.get("score", user.get("score"))
+        if score not in [None, ""]:
+            self.player_meta_text.insert("end", f"Score: {score}\n")
+        kills = user_meta.get("kills", user.get("kills"))
+        if kills not in [None, ""]:
+            self.player_meta_text.insert("end", f"Kills: {kills}\n")
+        deaths = user_meta.get("deaths", user.get("deaths"))
+        if deaths not in [None, ""]:
+            self.player_meta_text.insert("end", f"Deaths: {deaths}\n")
+        if uid.startswith("S"):
+            steam_id = uid[1:]
+            self.player_meta_text.insert("end", "Profile: ")
+            self.insert_link(self.player_meta_text, steam_id, f"https://steamcommunity.com/profiles/{steam_id}")
+            self.player_meta_text.insert("end", "\n")
+
+        if user_meta:
+            self.player_meta_text.insert("end", "\nMetadata:\n")
+            known_meta = {"team", "vehicle", "ready", "launched", "name", "score", "kills", "deaths"}
+            for mk in sorted(user_meta.keys()):
+                if mk in known_meta:
+                    continue
+                self.player_meta_text.insert("end", f" - {mk}: {self._fmt_compact_value(user_meta.get(mk))}\n")
+
+        self.player_meta_text.config(state="disabled")
 
     def save_ui_config(self):
         self.config["proxy_enabled"] = self.proxy_enabled_var.get()
@@ -3048,21 +3205,50 @@ class BZLobbyMonitor:
             users = lobby.get("users", {})
             max_p = l_meta.get("maxPlayers", "?")
             self.lobby_details_text.insert("end", f"Players: {len(users)} / {max_p}\n")
-
+            if l_meta.get("tps") is not None:
+                self.lobby_details_text.insert("end", f"TPS: {l_meta.get('tps')}\n")
+            if l_meta.get("pingMs") is not None:
+                self.lobby_details_text.insert("end", f"Ping: {l_meta.get('pingMs')} ms (inferred)\n")
+            if l_meta.get("maxPingMs") is not None:
+                self.lobby_details_text.insert("end", f"Max Ping: {l_meta.get('maxPingMs')} ms\n")
+            if l_meta.get("gameTimeMinutes") is not None:
+                self.lobby_details_text.insert("end", f"Game Time: {l_meta.get('gameTimeMinutes')} min (inferred)\n")
+            if l_meta.get("typeDetailId") is not None:
+                self.lobby_details_text.insert("end", f"Type Detail ID: {l_meta.get('typeDetailId')} (inferred)\n")
+            if l_meta.get("natType") is not None:
+                self.lobby_details_text.insert("end", f"NAT Type: {l_meta.get('natType')}\n")
+            if l_meta.get("passwordProtected") is not None:
+                self.lobby_details_text.insert("end", f"Passworded: {l_meta.get('passwordProtected')}\n")
+            if l_meta.get("hostMessage"):
+                self.lobby_details_text.insert("end", f"Host Message: {l_meta.get('hostMessage')}\n")
+            if l_meta.get("modsCrc"):
+                self.lobby_details_text.insert("end", f"Mods CRC: {l_meta.get('modsCrc')}\n")
+            if l_meta.get("modList"):
+                self.lobby_details_text.insert("end", f"Mods: {l_meta.get('modList')}\n")
+            elif l_meta.get("mapModCrc"):
+                self.lobby_details_text.insert("end", f"Mods: {l_meta.get('mapModCrc')}\n")
+        elif l_meta.get("gameType") == "BZCC (RakNet)":
+            users = lobby.get("users", {})
+            self.lobby_details_text.insert("end", f"Status: {l_meta.get('connectionStatus', 'Unknown')}\n")
+            self.lobby_details_text.insert("end", f"Version: {l_meta.get('version', '?')}\n")
+            self.lobby_details_text.insert("end", f"Players: {len(users)} / {lobby.get('memberLimit', '?')}\n")
+            if l_meta.get("motd"):
+                self.lobby_details_text.insert("end", f"MOTD: {l_meta.get('motd')}\n")
+            if l_meta.get("mods"):
+                self.lobby_details_text.insert("end", f"Mods: {l_meta.get('mods')}\n")
+            if l_meta.get("mapUrl"):
+                self.lobby_details_text.insert("end", "Map URL: ")
+                self.insert_link(self.lobby_details_text, l_meta.get("mapUrl"), l_meta.get("mapUrl"))
+                self.lobby_details_text.insert("end", "\n")
+        
         # Parse Game Settings from Lobby Metadata
         if game_settings:
-            parts = game_settings.split("*")
-            if len(parts) > 1:
-                self.lobby_details_text.insert("end", f"Map: {parts[1]}\n")
-            if len(parts) > 3 and parts[3] not in ["0", ""]:
-                mod_id = parts[3]
-
+            map_name = extract_map_name_from_game_settings(game_settings, default=None)
+            if map_name:
+                self.lobby_details_text.insert("end", f"Map: {map_name}\n")
+            if mod_id:
                 self.lobby_details_text.insert("end", f"Mod ID: {mod_id} (")
-                self.insert_link(
-                    self.lobby_details_text,
-                    "Workshop",
-                    f"https://steamcommunity.com/sharedfiles/filedetails/?id={mod_id}",
-                )
+                self.insert_link(self.lobby_details_text, "Workshop", f"https://steamcommunity.com/sharedfiles/filedetails/?id={mod_id}")
                 self.lobby_details_text.insert("end", ")\n")
         else:
             self.lobby_details_text.insert("end", f"Game Settings: {game_settings}\n")
