@@ -55,6 +55,125 @@ def extract_workshop_mod_id(game_settings):
     return None
 
 
+def _flag_from_game_setting(value):
+    try:
+        return bool(int(str(value).strip()))
+    except (TypeError, ValueError):
+        return False
+
+
+def parse_game_settings(game_settings):
+    if not game_settings:
+        return {}
+
+    parts = str(game_settings).split("*")
+    details = {}
+    if len(parts) > 1 and parts[1].strip():
+        details["map"] = parts[1].strip()
+    if len(parts) > 2 and parts[2].strip():
+        details["crc32"] = parts[2].strip()
+    if len(parts) > 3 and parts[3].strip() not in ["", "0"]:
+        details["mod_id"] = parts[3].strip()
+
+    attributes = {}
+    if len(parts) > 4:
+        attributes["satellite"] = _flag_from_game_setting(parts[4])
+    if len(parts) > 5:
+        attributes["barracks"] = _flag_from_game_setting(parts[5])
+    if len(parts) > 6:
+        attributes["sniper"] = _flag_from_game_setting(parts[6])
+    if len(parts) > 7:
+        attributes["splinter"] = _flag_from_game_setting(parts[7])
+    if len(parts) > 8 and parts[8].strip():
+        attributes["lives"] = parts[8].strip()
+    if attributes:
+        details["attributes"] = attributes
+
+    return details
+
+
+def format_game_settings_summary(game_settings):
+    details = parse_game_settings(game_settings)
+    attributes = details.get("attributes", {})
+    parts = []
+
+    if details.get("map"):
+        parts.append(f"Map: {details['map']}")
+    if details.get("mod_id"):
+        parts.append(f"Mod: {details['mod_id']}")
+    if attributes.get("lives"):
+        parts.append(f"Lives: {attributes['lives']}")
+
+    enabled = [
+        label
+        for key, label in [
+            ("satellite", "Satellite"),
+            ("barracks", "Barracks"),
+            ("sniper", "Sniper"),
+            ("splinter", "Splinter"),
+        ]
+        if attributes.get(key)
+    ]
+    if enabled:
+        parts.append("Rules: " + ", ".join(enabled))
+
+    return " | ".join(parts)
+
+
+def get_lobby_game_settings(lobby):
+    if not isinstance(lobby, dict):
+        return ""
+
+    metadata = lobby.get("metadata", {})
+    if isinstance(metadata, dict):
+        for key in ("gameSettings", "ready"):
+            value = metadata.get(key)
+            if value:
+                return value
+    return ""
+
+
+def get_lobby_app_id(lobby, default="301650"):
+    if not isinstance(lobby, dict):
+        return default
+
+    metadata = lobby.get("metadata", {})
+    game_type = ""
+    if isinstance(metadata, dict):
+        game_type = str(metadata.get("gameType", ""))
+    return "624970" if "BZCC" in game_type else default
+
+
+def build_steam_join_url(lobby_id, lobby, default_host_steam_id="76561198104781489"):
+    if lobby_id in [None, ""]:
+        return None
+
+    app_id = get_lobby_app_id(lobby)
+    owner_id = str(lobby.get("owner", "")) if isinstance(lobby, dict) else ""
+    host_steam_id = owner_id[1:] if owner_id.startswith("S") else default_host_steam_id
+    return f"steam://rungame/{app_id}/{host_steam_id}/+connect_lobby=B{lobby_id}"
+
+
+def build_lobby_share_text(lobby_id, lobby):
+    if not isinstance(lobby, dict):
+        return ""
+
+    metadata = lobby.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    name = clean_lobby_name(metadata.get("name"), default=f"Lobby {lobby_id}")
+    users = lobby.get("users", {})
+    player_count = f"{len(users) if isinstance(users, dict) else 0}/{lobby.get('memberLimit', '?')}"
+    map_name = extract_map_name_from_metadata(metadata, default="?")
+    join_url = build_steam_join_url(lobby_id, lobby)
+
+    parts = [f"{name}", f"{player_count} players", f"Map: {map_name}"]
+    if join_url:
+        parts.append(join_url)
+    return " | ".join(parts)
+
+
 def extract_lobby_version(lobby, default="?"):
     if not isinstance(lobby, dict):
         return default

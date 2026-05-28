@@ -26,6 +26,21 @@ import subprocess
 import shutil
 import base64
 
+from bzr_monitor_utils import (
+    build_lobby_share_text,
+    build_steam_join_url,
+    extract_map_name_from_game_settings,
+    extract_map_name_from_metadata,
+    format_game_settings_summary,
+    get_lobby_age_label,
+    get_lobby_network_label,
+    get_lobby_source,
+    get_lobby_status_flags,
+    is_lobby_stale,
+    parse_game_settings,
+    stamp_lobby,
+)
+
 if sys.platform == "win32":
     import winreg
     import winsound
@@ -461,6 +476,10 @@ class BZLobbyMonitor:
             action_frame, text="Join (Steam)", command=self.join_steam_lobby
         )
         self.steam_join_btn.pack(side="left", padx=2)
+        self.copy_share_btn = ttk.Button(
+            action_frame, text="Copy Share", command=self.copy_lobby_share_text
+        )
+        self.copy_share_btn.pack(side="left", padx=2)
         self.discord_status_btn = ttk.Button(
             action_frame, text="Post Status (Discord)", command=self.post_lobby_status
         )
@@ -497,9 +516,12 @@ class BZLobbyMonitor:
         paned = ttk.PanedWindow(self.lobby_tab, orient="vertical")
         paned.pack(fill="both", expand=True, padx=5, pady=5)
 
-        # Top Pane: Lobby List
-        lobby_frame = ttk.LabelFrame(paned, text="Lobbies", padding=5)
-        paned.add(lobby_frame, weight=3)
+        # Top Pane: Lobby List and Waiting Room
+        list_pane = ttk.PanedWindow(paned, orient="horizontal")
+        paned.add(list_pane, weight=3)
+
+        lobby_frame = ttk.LabelFrame(list_pane, text="Lobbies", padding=5)
+        list_pane.add(lobby_frame, weight=4)
 
         columns = (
             "ID",
@@ -533,6 +555,21 @@ class BZLobbyMonitor:
         scrollbar.pack(side="right", fill="y")
 
         self.tree.bind("<<TreeviewSelect>>", self.on_lobby_select)
+
+        waiting_frame = ttk.LabelFrame(list_pane, text="Waiting Room", padding=5)
+        list_pane.add(waiting_frame, weight=1)
+        self.waiting_room_text = tk.Text(
+            waiting_frame,
+            height=8,
+            width=26,
+            state="disabled",
+            bg="#050505",
+            fg=self.colors["fg"],
+            insertbackground=self.colors["highlight"],
+            font=("Consolas", 9),
+            wrap="word",
+        )
+        self.waiting_room_text.pack(fill="both", expand=True)
 
         # Bottom Pane: Details & Logs
         bottom_pane = ttk.PanedWindow(paned, orient="horizontal")
@@ -618,6 +655,8 @@ class BZLobbyMonitor:
             widget.tag_bind("link", "<Leave>", lambda e, w=widget: w.config(cursor=""))
             widget.tag_bind("link", "<Button-1>", self.on_link_click)
             widget.tag_config("griefer", foreground="red", font=("Segoe UI", 9, "bold"))
+            widget.tag_config("host", foreground="#ffcc00", font=("Segoe UI", 9, "bold"))
+            widget.tag_config("team_header", foreground=self.colors["highlight"], font=("Segoe UI", 9, "bold"))
             widget.tag_config(
                 "friend",
                 foreground=self.colors["highlight"],
@@ -1729,36 +1768,41 @@ class BZLobbyMonitor:
             self.ws.send(json.dumps(msg))
             self.log(f"Requesting Join Lobby: {lid}")
 
-    def join_steam_lobby(self):
+    def get_selected_lobby(self):
         selected_items = self.tree.selection()
         if not selected_items:
+            return None, None
+
+        lid = str(self.tree.item(selected_items[0])["values"][0])
+        return lid, self.lobbies.get(lid)
+
+    def join_steam_lobby(self):
+        lid, lobby = self.get_selected_lobby()
+        if not lid:
             self.flash_button_text(self.steam_join_btn, "Select Lobby")
             return
 
-        lid = str(self.tree.item(selected_items[0])["values"][0])
-        lobby = self.lobbies.get(lid)
         if not lobby:
             return
 
-        # Determine game type and Steam app ID
-        meta = lobby.get("metadata", {})
-        game_type = meta.get("gameType", "")
-
-        # BZCC uses app ID 624970, BZ98R uses 301650
-        if "BZCC" in game_type:
-            app_id = "624970"
-        else:
-            app_id = "301650"  # Default to BZ98R
-
-        host_steam_id = "76561198104781489"  # Default fallback
-        owner_id = str(lobby.get("owner", ""))
-
-        if owner_id.startswith("S"):
-            host_steam_id = owner_id[1:]
-
-        url = f"steam://rungame/{app_id}/{host_steam_id}/+connect_lobby=B{lid}"
+        url = build_steam_join_url(lid, lobby)
         self.log(f"Opening Steam URL: {url}")
         webbrowser.open(url)
+
+    def copy_lobby_share_text(self):
+        lid, lobby = self.get_selected_lobby()
+        if not lid:
+            self.flash_button_text(self.copy_share_btn, "Select Lobby")
+            return
+        if not lobby:
+            return
+
+        share_text = build_lobby_share_text(lid, lobby)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(share_text)
+        self.root.update()
+        self.flash_button_text(self.copy_share_btn, "Copied")
+        self.log(f"Copied share text: {share_text}")
 
     def show_player_context_menu(self, event):
         try:
@@ -3109,21 +3153,7 @@ class BZLobbyMonitor:
             locked = "Yes" if lobby.get("isLocked") else "No"
             is_private = "Yes" if lobby.get("isPrivate") else "No"
 
-            # Parse Map Name
-            map_name = "?"
-            game_settings = meta.get("gameSettings", "")
-            ready = meta.get("ready", "")
-
-            if ready:
-                parts = ready.split("*")
-                if len(parts) >= 2:
-                    map_name = parts[1]
-            elif game_settings:
-                parts = game_settings.split("*")
-                if len(parts) >= 2:
-                    map_name = parts[1]
-            if map_name == "unknown":
-                map_name = "?"
+            map_name = extract_map_name_from_metadata(meta, default="?")
 
             tags = ("friend",) if has_friend else ()
             self.tree.insert(
@@ -3149,6 +3179,40 @@ class BZLobbyMonitor:
                 if str(self.tree.item(item)["values"][0]) == str(selected_id):
                     self.tree.selection_set(item)
                     break
+        self.refresh_waiting_room()
+
+    def refresh_waiting_room(self):
+        if not hasattr(self, "waiting_room_text"):
+            return
+
+        waiting_rows = []
+        for lobby in self.lobbies.values():
+            if not isinstance(lobby, dict) or not lobby.get("isChat"):
+                continue
+            meta = lobby.get("metadata", {})
+            name = meta.get("name", "Lounge") if isinstance(meta, dict) else "Lounge"
+            if "~~" in str(name):
+                name = str(name).split("~~")[-1]
+            users = lobby.get("users", {})
+            if not isinstance(users, dict) or not users:
+                continue
+
+            player_names = []
+            for uid, user in users.items():
+                player_names.append(self.get_user_display_name(uid, user))
+            waiting_rows.append((str(name), sorted(player_names, key=str.lower)))
+
+        self.waiting_room_text.config(state="normal")
+        self.waiting_room_text.delete("1.0", "end")
+        if not waiting_rows:
+            self.waiting_room_text.insert("end", "No players waiting.")
+        else:
+            for lobby_name, player_names in sorted(waiting_rows, key=lambda row: row[0].lower()):
+                self.waiting_room_text.insert("end", f"{lobby_name}\n")
+                for player_name in player_names:
+                    self.waiting_room_text.insert("end", f" - {player_name}\n")
+                self.waiting_room_text.insert("end", "\n")
+        self.waiting_room_text.config(state="disabled")
 
     def on_lobby_select(self, event):
         selected_items = self.tree.selection()
@@ -3161,6 +3225,33 @@ class BZLobbyMonitor:
         if lobby:
             self.update_lobby_details(lobby)
             self.update_player_details(lobby)
+
+    def get_user_display_name(self, uid, user):
+        if not isinstance(user, dict):
+            return str(uid)
+
+        user_name = user.get("name", "Unknown")
+        user_meta = user.get("metadata", {})
+        if (user_name == "unknown" or not user_name) and isinstance(user_meta, dict):
+            user_name = user_meta.get("name", "Unknown")
+        return str(user_name or uid)
+
+    def get_user_team_group(self, user):
+        if not isinstance(user, dict):
+            return "No Team"
+
+        user_meta = user.get("metadata", {})
+        team = user_meta.get("team") if isinstance(user_meta, dict) else None
+        if team in [None, ""]:
+            team = user.get("team")
+        if team in [None, ""]:
+            return "No Team"
+
+        try:
+            team_num = int(team)
+        except (TypeError, ValueError):
+            return f"Team {team}"
+        return "Odds" if team_num % 2 else "Evens"
 
     def update_lobby_details(self, lobby):
         self.lobby_details_text.config(state="normal")
@@ -3243,13 +3334,19 @@ class BZLobbyMonitor:
         
         # Parse Game Settings from Lobby Metadata
         if game_settings:
-            map_name = extract_map_name_from_game_settings(game_settings, default=None)
+            settings = parse_game_settings(game_settings)
+            map_name = settings.get("map") or extract_map_name_from_game_settings(game_settings, default=None)
             if map_name:
                 self.lobby_details_text.insert("end", f"Map: {map_name}\n")
+            if settings.get("crc32"):
+                self.lobby_details_text.insert("end", f"CRC32: {settings.get('crc32')}\n")
             if mod_id:
                 self.lobby_details_text.insert("end", f"Mod ID: {mod_id} (")
                 self.insert_link(self.lobby_details_text, "Workshop", f"https://steamcommunity.com/sharedfiles/filedetails/?id={mod_id}")
                 self.lobby_details_text.insert("end", ")\n")
+            summary = format_game_settings_summary(game_settings)
+            if summary:
+                self.lobby_details_text.insert("end", f"Settings: {summary}\n")
         else:
             self.lobby_details_text.insert("end", f"Game Settings: {game_settings}\n")
 
@@ -3266,99 +3363,129 @@ class BZLobbyMonitor:
 
         users = lobby.get("users", {})
         friends = self.config.get("friend_list", "").lower().splitlines()
-        for uid, user in users.items():
-            user_name = user.get("name", "Unknown")
-            user_meta = user.get("metadata", {})
+        owner_id = str(lobby.get("owner", ""))
+        groups = {}
+        if isinstance(users, dict):
+            for uid, user in users.items():
+                group_name = self.get_user_team_group(user)
+                groups.setdefault(group_name, []).append((str(uid), user))
 
-            # Fallback to metadata if root name is unknown
-            if user_name == "unknown" or not user_name:
-                user_name = user_meta.get("name", "Unknown")
+        ordered_groups = ["Odds", "Evens", "No Team"]
+        ordered_groups.extend(sorted(k for k in groups if k not in ordered_groups))
 
-            is_friend = any(
-                f.strip() in user_name.lower() or f.strip() in str(uid).lower()
-                for f in friends
-                if f.strip()
+        if not groups:
+            self.player_details_text.insert("end", "No players in this lobby.")
+
+        for group_name in ordered_groups:
+            entries = groups.get(group_name, [])
+            if not entries:
+                continue
+
+            entries.sort(
+                key=lambda item: (
+                    str(item[0]) != owner_id,
+                    self.get_user_display_name(item[0], item[1]).lower(),
+                )
             )
+            self.player_details_text.insert("end", f"{group_name}\n", "team_header")
 
-            self.player_details_text.insert(
-                "end", f" - {user_name} (ID: {uid})", "friend" if is_friend else ""
-            )
-            if is_friend:
-                self.player_details_text.insert("end", " [FRIEND]", "friend")
-            self.player_details_text.insert("end", "\n")
-            self.player_details_text.insert("end", f"   IP: {user.get('ipAddress')}\n")
-            self.player_details_text.insert("end", f"   Auth: {user.get('authType')}\n")
+            for uid, user in entries:
+                user = user if isinstance(user, dict) else {}
+                user_name = self.get_user_display_name(uid, user)
+                user_meta = user.get("metadata", {})
+                if not isinstance(user_meta, dict):
+                    user_meta = {}
 
-            # Geo Lookup
-            ip = user.get("ipAddress")
-            if ip and ip != "unknown":
-                geo = self.get_geo_info(ip)
-                if geo:
-                    self.player_details_text.insert("end", f"   Loc: {geo}\n")
-
-            if uid.startswith("S"):
-                steam_id = uid[1:]
-
-                if HAS_PIL:
-                    if steam_id in self.image_cache:
-                        self.player_details_text.image_create(
-                            "end", image=self.image_cache[steam_id]
-                        )
-                        self.player_details_text.insert("end", " ")
-                    elif steam_id not in self.pending_fetches:
-                        self.fetch_image(steam_id, is_mod=False)
-
-                self.player_details_text.insert("end", "   Profile: ")
-                self.insert_link(
-                    self.player_details_text,
-                    f"{steam_id}",
-                    f"https://steamcommunity.com/profiles/{steam_id}",
+                is_friend = any(
+                    f.strip() in user_name.lower() or f.strip() in str(uid).lower()
+                    for f in friends
+                    if f.strip()
                 )
 
-                if steam_id == "76561198297657246":
-                    self.player_details_text.insert(
-                        "end", " [KNOWN GRIEFER]", "griefer"
-                    )
-
+                self.player_details_text.insert(
+                    "end", f" - {user_name} (ID: {uid})", "friend" if is_friend else ""
+                )
+                if str(uid) == owner_id:
+                    self.player_details_text.insert("end", " [HOST]", "host")
+                if is_friend:
+                    self.player_details_text.insert("end", " [FRIEND]", "friend")
                 self.player_details_text.insert("end", "\n")
+                self.player_details_text.insert("end", f"   Auth: {user.get('authType')}\n")
 
-            # Extended User Info
-            if user_meta:
-                if "team" in user_meta:
-                    self.player_details_text.insert(
-                        "end", f"   Team: {user_meta['team']}\n"
-                    )
-                if "vehicle" in user_meta:
-                    self.player_details_text.insert(
-                        "end", f"   Vehicle: {user_meta['vehicle']}\n"
+                # Geo Lookup
+                ip = user.get("ipAddress")
+                if ip and ip != "unknown":
+                    self.player_details_text.insert("end", f"   IP: {ip}\n")
+                    geo = self.get_geo_info(ip)
+                    if geo:
+                        self.player_details_text.insert("end", f"   Loc: {geo}\n")
+
+                if uid.startswith("S"):
+                    steam_id = uid[1:]
+
+                    if HAS_PIL:
+                        if steam_id in self.image_cache:
+                            self.player_details_text.insert("end", "   Avatar: ")
+                            self.player_details_text.image_create(
+                                "end", image=self.image_cache[steam_id]
+                            )
+                            self.player_details_text.insert("end", "\n")
+                        elif steam_id not in self.pending_fetches:
+                            self.fetch_image(steam_id, is_mod=False)
+
+                    self.player_details_text.insert("end", "   Profile: ")
+                    self.insert_link(
+                        self.player_details_text,
+                        f"{steam_id}",
+                        f"https://steamcommunity.com/profiles/{steam_id}",
                     )
 
-                # Parse Ready String for Map info (often on host)
-                ready = user_meta.get("ready")
-                if ready:
-                    r_parts = ready.split("*")
-                    if len(r_parts) > 1:
+                    if steam_id == "76561198297657246":
                         self.player_details_text.insert(
-                            "end", f"   Ready Map: {r_parts[1]}\n"
+                            "end", " [KNOWN GRIEFER]", "griefer"
                         )
-                if user_meta.get("launched") == "1":
-                    self.player_details_text.insert("end", f"   Status: Launched\n")
 
-            # Network Info
-            wan = user.get("wanAddress")
-            if wan and wan != "unknown":
-                self.player_details_text.insert("end", f"   WAN: {wan}\n")
+                    self.player_details_text.insert("end", "\n")
 
-            lans = user.get("lanAddresses")
-            if lans:
-                if isinstance(lans, list):
-                    lan_str = ", ".join(lans)
-                else:
-                    lan_str = str(lans)
-                if lan_str:
-                    self.player_details_text.insert("end", f"   LAN: {lan_str}\n")
+                # Extended User Info
+                if user_meta:
+                    if "team" in user_meta:
+                        self.player_details_text.insert(
+                            "end", f"   Team: {user_meta['team']}\n"
+                        )
+                    if "vehicle" in user_meta:
+                        self.player_details_text.insert(
+                            "end", f"   Vehicle: {user_meta['vehicle']}\n"
+                        )
 
-            self.player_details_text.insert("end", "-" * 30 + "\n")
+                    # Parse Ready String for Map info (often on host)
+                    ready = user_meta.get("ready")
+                    if ready:
+                        ready_map = extract_map_name_from_game_settings(ready, default=None)
+                        if ready_map:
+                            self.player_details_text.insert(
+                                "end", f"   Ready Map: {ready_map}\n"
+                            )
+                    if user_meta.get("launched") == "1":
+                        self.player_details_text.insert("end", f"   Status: Launched\n")
+
+                # Network Info
+                wan = user.get("wanAddress")
+                if wan and wan != "unknown":
+                    self.player_details_text.insert("end", f"   WAN: {wan}\n")
+
+                lans = user.get("lanAddresses")
+                if lans:
+                    if isinstance(lans, list):
+                        lan_str = ", ".join(lans)
+                    else:
+                        lan_str = str(lans)
+                    if lan_str:
+                        self.player_details_text.insert(
+                            "end", f"   LAN: {lan_str}\n"
+                        )
+
+                self.player_details_text.insert("end", "-" * 30 + "\n")
 
         self.player_details_text.config(state="disabled")
         self.player_details_text.yview_moveto(scroll_pos[0])
@@ -3869,15 +3996,8 @@ class BZLobbyMonitor:
         users = lobby.get("users", {})
         player_count = f"{len(users)}/{lobby.get('memberLimit', '?')}"
 
-        map_name = "Unknown"
-        if "ready" in meta:
-            parts = meta["ready"].split("*")
-            if len(parts) >= 2:
-                map_name = parts[1]
-        elif "gameSettings" in meta:
-            parts = meta["gameSettings"].split("*")
-            if len(parts) >= 2:
-                map_name = parts[1]
+        map_name = extract_map_name_from_metadata(meta, default="Unknown")
+        settings_summary = format_game_settings_summary(meta.get("gameSettings", ""))
 
         embed = {
             "title": f"🎮 {name}",
@@ -3891,12 +4011,14 @@ class BZLobbyMonitor:
                 "text": f"Battlezone Lobby Monitor • {datetime.now().strftime('%H:%M')}"
             },
         }
+        if settings_summary:
+            embed["fields"].append(
+                {"name": "Settings", "value": settings_summary, "inline": False}
+            )
 
         # Add join link if host is steam
-        owner_id = str(lobby.get("owner", ""))
-        if owner_id.startswith("S"):
-            steam_id = owner_id[1:]
-            url = f"steam://rungame/301650/{steam_id}/+connect_lobby=B{self.current_lobby_id}"
+        url = build_steam_join_url(self.current_lobby_id, lobby)
+        if url:
             embed["description"] = f"[**Click to Join via Steam**]({url})"
 
         self.send_to_discord(embed=embed)

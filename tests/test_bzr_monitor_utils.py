@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 
 from bzr_monitor_utils import (
     aggregate_recent_player_counts,
+    build_lobby_share_text,
+    build_steam_join_url,
     build_bzcc_lobby,
     clean_lobby_name,
     decode_bzcc_name,
@@ -17,6 +19,8 @@ from bzr_monitor_utils import (
     get_lobby_source,
     get_lobby_status_flags,
     is_lobby_stale,
+    format_game_settings_summary,
+    parse_game_settings,
     parse_bz2_unconnected_pong,
     parse_raknet_frames,
     stamp_lobby,
@@ -52,6 +56,47 @@ class MapParsingTests(unittest.TestCase):
 
     def test_extract_workshop_mod_id_ignores_zero(self):
         self.assertIsNone(extract_workshop_mod_id("*map*mode*0*"))
+
+    def test_parse_game_settings_extracts_match_rules(self):
+        details = parse_game_settings("*isoa*ABCD*12345*1*0*1*0*5*")
+        self.assertEqual(details["map"], "isoa")
+        self.assertEqual(details["crc32"], "ABCD")
+        self.assertEqual(details["mod_id"], "12345")
+        self.assertEqual(details["attributes"]["lives"], "5")
+        self.assertTrue(details["attributes"]["satellite"])
+        self.assertFalse(details["attributes"]["barracks"])
+        self.assertTrue(details["attributes"]["sniper"])
+        self.assertFalse(details["attributes"]["splinter"])
+
+    def test_format_game_settings_summary_includes_enabled_rules(self):
+        summary = format_game_settings_summary("*isoa*ABCD*0*1*1*0*0*3*")
+        self.assertEqual(summary, "Map: isoa | Lives: 3 | Rules: Satellite, Barracks")
+
+
+class ShareLinkTests(unittest.TestCase):
+    def test_build_steam_join_url_uses_steam_owner(self):
+        lobby = {"owner": "S76561198000000000", "metadata": {"gameType": "0"}}
+        self.assertEqual(
+            build_steam_join_url("42", lobby),
+            "steam://rungame/301650/76561198000000000/+connect_lobby=B42",
+        )
+
+    def test_build_steam_join_url_uses_bzcc_app_id(self):
+        lobby = {"owner": "S76561198000000000", "metadata": {"gameType": "BZCC"}}
+        self.assertIn("steam://rungame/624970/", build_steam_join_url("GUID", lobby))
+
+    def test_build_lobby_share_text_includes_name_count_map_and_url(self):
+        lobby = {
+            "owner": "S76561198000000000",
+            "memberLimit": 8,
+            "metadata": {"name": "~chat~pub~~Strategy Night", "gameSettings": "*bdog*"},
+            "users": {"A": {}, "B": {}},
+        }
+        text = build_lobby_share_text("42", lobby)
+        self.assertIn("Strategy Night", text)
+        self.assertIn("2/8 players", text)
+        self.assertIn("Map: bdog", text)
+        self.assertIn("+connect_lobby=B42", text)
 
 
 class VersionTests(unittest.TestCase):
