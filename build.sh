@@ -1,12 +1,19 @@
 #!/bin/bash
 # Build script for macOS and Linux
 
+set -e
+
+VERSION="${VERSION:-0.0.0}"
+VERSION="${VERSION#v}"
+APP_NAME="BZLobbyMonitor"
+ARCHIVE_PREFIX="Battlezone_LobbyMonitor-v${VERSION}"
+
 # Install dependencies
 pip install -r requirements.txt
 pip install pyinstaller
 
 # Build for current platform
-pyinstaller --name "bzr_monitor" \
+pyinstaller --name "${APP_NAME}" \
     --onefile \
     --windowed \
     --add-data "bzr_monitor_config.json:." \
@@ -19,18 +26,21 @@ pyinstaller --name "bzr_monitor" \
     --hidden-import=PIL \
     bzr_monitor.py
 
-# Create platform-specific release archive
+mkdir -p releases
+
+# Create platform-specific release archive. The executable name stays versionless;
+# only the archive carries the release version.
 if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    PLATFORM="linux-x64"
-    BINARY="bzr_monitor"
     cd dist
-    tar -czf ../releases/bzr_monitor-v1.0.0-${PLATFORM}.tar.gz ${BINARY}
+    tar -czf "../releases/${ARCHIVE_PREFIX}-linux-x64.tar.gz" "${APP_NAME}"
     cd ..
 elif [[ "$OSTYPE" == "darwin"* ]]; then
-    PLATFORM="macos-x64"
-    BINARY="bzr_monitor"
     cd dist
-    zip -r ../releases/bzr_monitor-v1.0.0-${PLATFORM}.zip ${BINARY}.app/
+    if [ -d "${APP_NAME}.app" ]; then
+        zip -qr "../releases/${ARCHIVE_PREFIX}-macos-x64.zip" "${APP_NAME}.app"
+    else
+        tar -czf "../releases/${ARCHIVE_PREFIX}-macos-x64.tar.gz" "${APP_NAME}"
+    fi
     cd ..
 fi
 
