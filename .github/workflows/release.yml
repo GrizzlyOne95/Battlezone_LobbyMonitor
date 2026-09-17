@@ -43,8 +43,11 @@ jobs:
         if: matrix.os == 'Windows'
         run: |
           python -m PyInstaller --name bzr_monitor --onefile --windowed `
+            --icon "branding/app_icon.png" `
+            --add-data "branding/app_icon.png;branding" `
             --add-data "LICENSE:." `
             --add-data "README.md:." `
+            --runtime-hook branding/pyinstaller_icon_hook.py `
             --hidden-import=websocket `
             --hidden-import=pystray `
             --hidden-import=pypresence `
@@ -56,8 +59,11 @@ jobs:
         if: matrix.os == 'macOS'
         run: |
           python -m PyInstaller --name bzr_monitor --onefile --windowed \
+            --icon "branding/app_icon.png" \
+            --add-data "branding/app_icon.png:branding" \
             --add-data "LICENSE:." \
             --add-data "README.md:." \
+            --runtime-hook branding/pyinstaller_icon_hook.py \
             --hidden-import=websocket \
             --hidden-import=pystray \
             --hidden-import=pypresence \
@@ -70,8 +76,11 @@ jobs:
         run: |
           pip install patchelf
           python -m PyInstaller --name bzr_monitor --onefile \
+            --icon "branding/app_icon.png" \
+            --add-data "branding/app_icon.png:branding" \
             --add-data "LICENSE:." \
             --add-data "README.md:." \
+            --runtime-hook branding/pyinstaller_icon_hook.py \
             --hidden-import=websocket \
             --hidden-import=pystray \
             --hidden-import=pypresence \
