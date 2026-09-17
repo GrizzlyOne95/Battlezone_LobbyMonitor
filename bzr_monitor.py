@@ -84,6 +84,73 @@ except ImportError:
     HAS_PIL = False
 
 CONFIG_FILE = "bzr_monitor_config.json"
+APP_USER_MODEL_ID = "GrizzlyOne95.Battlezone.LobbyMonitor"
+
+
+def _set_app_user_model_id():
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:
+        pass
+
+
+def _resolve_bundled_icon(name):
+    """Locate a bundled icon working from source and under sys._MEIPASS."""
+    candidates = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, "branding", name))
+        candidates.append(os.path.join(meipass, name))
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(here, "branding", name))
+    candidates.append(os.path.join(here, name))
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def apply_window_icon(window):
+    """Apply the canonical app icon to a Tk/Toplevel window."""
+    try:
+        ico_path = _resolve_bundled_icon("app_icon.ico") or _resolve_bundled_icon("bzrmon.ico")
+        if ico_path:
+            try:
+                window.iconbitmap(ico_path)
+            except Exception:
+                pass
+        png_path = _resolve_bundled_icon("app_icon.png")
+        if png_path:
+            try:
+                image = tk.PhotoImage(file=png_path)
+                window.iconphoto(True, image)
+                window._battlezone_app_icon = image
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def load_tray_image():
+    """Load the canonical tray icon, working from source and frozen builds."""
+    if not HAS_PIL:
+        return None
+    for name in ("app_icon.png", "app_icon.ico", "bzrmon.ico"):
+        path = _resolve_bundled_icon(name)
+        if path:
+            try:
+                return Image.open(path)
+            except Exception:
+                continue
+    try:
+        return Image.new("RGB", (64, 64), color=(0, 255, 0))
+    except Exception:
+        return None
+
+
+_set_app_user_model_id()
 
 
 class BZLobbyMonitor:
@@ -93,13 +160,7 @@ class BZLobbyMonitor:
         self.root.geometry("1000x700")
         self.root.minsize(800, 600)
 
-        try:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            icon_path = os.path.join(base_dir, "bzrmon.ico")
-            if os.path.exists(icon_path):
-                self.root.iconbitmap(icon_path)
-        except:
-            pass
+        apply_window_icon(self.root)
 
         self.lobbies = {}
         self.ws = None
@@ -1692,23 +1753,10 @@ class BZLobbyMonitor:
 
         image = None
         if HAS_PIL:
-            # Create a simple icon if none exists
+            # Canonical Lobby Monitor artwork for the system tray.
             try:
-                # Try to load existing icon
-                base_dir = os.path.dirname(os.path.abspath(__file__))
-                icon_path = os.path.join(base_dir, "bzrmon.ico")
-                if not os.path.exists(icon_path):
-                    icon_path = os.path.join(
-                        base_dir, "bzrtex.ico"
-                    )  # Reuse existing if available
-                if not os.path.exists(icon_path):
-                    icon_path = os.path.join(base_dir, "wb.ico")
-
-                if os.path.exists(icon_path):
-                    image = Image.open(icon_path)
-                else:
-                    image = Image.new("RGB", (64, 64), color=(0, 255, 0))
-            except:
+                image = load_tray_image()
+            except Exception:
                 pass
 
         if image:
@@ -2112,6 +2160,7 @@ class BZLobbyMonitor:
 
     def open_raknet_debugger(self):
         win = tk.Toplevel(self.root)
+        apply_window_icon(win)
         win.title("RakNet Packet Debugger")
         win.geometry("600x400")
 

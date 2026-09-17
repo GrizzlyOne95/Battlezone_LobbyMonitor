@@ -39,11 +39,16 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Generate canonical app icon
+        run: |
+          python scripts/generate_app_icon.py branding/repo_icon.svg branding/app_icon.ico --png branding/app_icon.png
+
       - name: Build executable (Windows)
         if: matrix.os == 'Windows'
         run: |
           python -m PyInstaller --name bzr_monitor --onefile --windowed `
-            --icon "branding/app_icon.png" `
+            --icon "branding/app_icon.ico" `
+            --add-data "branding/app_icon.ico;branding" `
             --add-data "branding/app_icon.png;branding" `
             --add-data "LICENSE:." `
             --add-data "README.md:." `
@@ -59,7 +64,8 @@ jobs:
         if: matrix.os == 'macOS'
         run: |
           python -m PyInstaller --name bzr_monitor --onefile --windowed \
-            --icon "branding/app_icon.png" \
+            --icon "branding/app_icon.ico" \
+            --add-data "branding/app_icon.ico:branding" \
             --add-data "branding/app_icon.png:branding" \
             --add-data "LICENSE:." \
             --add-data "README.md:." \
@@ -76,7 +82,8 @@ jobs:
         run: |
           pip install patchelf
           python -m PyInstaller --name bzr_monitor --onefile \
-            --icon "branding/app_icon.png" \
+            --icon "branding/app_icon.ico" \
+            --add-data "branding/app_icon.ico:branding" \
             --add-data "branding/app_icon.png:branding" \
             --add-data "LICENSE:." \
             --add-data "README.md:." \
