@@ -26,7 +26,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='bzr_monitor',
+    name='BZLobbyMonitor',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
