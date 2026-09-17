@@ -14,16 +14,16 @@ jobs:
         include:
           - os: Windows
             os-version: windows-latest
-            artifact-name: bzr_monitor-windows-x64.exe
-            output-path: dist/bzr_monitor.exe
+            artifact-name: Battlezone_LobbyMonitor-windows-x64
+            output-path: dist/BZLobbyMonitor.exe
           - os: macOS
             os-version: macos-latest
-            artifact-name: bzr_monitor-macos-x64
-            output-path: dist/bzr_monitor
+            artifact-name: Battlezone_LobbyMonitor-macos-x64
+            output-path: dist/BZLobbyMonitor
           - os: Linux
             os-version: ubuntu-latest
-            artifact-name: bzr_monitor-linux-x64
-            output-path: dist/bzr_monitor
+            artifact-name: Battlezone_LobbyMonitor-linux-x64
+            output-path: dist/BZLobbyMonitor
 
     steps:
       - uses: actions/checkout@v4
@@ -43,11 +43,17 @@ jobs:
         run: |
           python scripts/generate_app_icon.py branding/repo_icon.svg branding/app_icon.ico --png branding/app_icon.png
 
+      - name: Generate Windows version metadata
+        if: matrix.os == 'Windows'
+        run: |
+          python scripts/generate_version_info.py --version "${{ github.ref_name }}" --output branding/version_info.txt
+
       - name: Build executable (Windows)
         if: matrix.os == 'Windows'
         run: |
-          python -m PyInstaller --name bzr_monitor --onefile --windowed `
+          python -m PyInstaller --name BZLobbyMonitor --onefile --windowed `
             --icon "branding/app_icon.ico" `
+            --version-file "branding/version_info.txt" `
             --add-data "branding/app_icon.ico;branding" `
             --add-data "branding/app_icon.png;branding" `
             --add-data "LICENSE:." `
@@ -63,7 +69,7 @@ jobs:
       - name: Build executable (macOS)
         if: matrix.os == 'macOS'
         run: |
-          python -m PyInstaller --name bzr_monitor --onefile --windowed \
+          python -m PyInstaller --name BZLobbyMonitor --onefile --windowed \
             --icon "branding/app_icon.ico" \
             --add-data "branding/app_icon.ico:branding" \
             --add-data "branding/app_icon.png:branding" \
@@ -81,7 +87,7 @@ jobs:
         if: matrix.os == 'Linux'
         run: |
           pip install patchelf
-          python -m PyInstaller --name bzr_monitor --onefile \
+          python -m PyInstaller --name BZLobbyMonitor --onefile \
             --icon "branding/app_icon.ico" \
             --add-data "branding/app_icon.ico:branding" \
             --add-data "branding/app_icon.png:branding" \
@@ -153,41 +159,39 @@ jobs:
         run: |
           mkdir -p releases
           ls -la release-artifacts/
-          
-          # Copy Windows executable
-          if [ -f "release-artifacts/bzr_monitor-windows-x64.exe/bzr_monitor.exe" ]; then
-            cp "release-artifacts/bzr_monitor-windows-x64.exe/bzr_monitor.exe" "releases/bzr_monitor-windows-x64.exe"
+
+          # Keep the standalone application binary names stable and versionless.
+          if [ -f "release-artifacts/Battlezone_LobbyMonitor-windows-x64/BZLobbyMonitor.exe" ]; then
+            cp "release-artifacts/Battlezone_LobbyMonitor-windows-x64/BZLobbyMonitor.exe" "releases/BZLobbyMonitor.exe"
           fi
-          
-          # Copy macOS executable
-          if [ -f "release-artifacts/bzr_monitor-macos-x64/bzr_monitor" ]; then
-            cp "release-artifacts/bzr_monitor-macos-x64/bzr_monitor" "releases/bzr_monitor-macos-x64"
-            chmod +x releases/bzr_monitor-macos-x64
+
+          if [ -f "release-artifacts/Battlezone_LobbyMonitor-macos-x64/BZLobbyMonitor" ]; then
+            cp "release-artifacts/Battlezone_LobbyMonitor-macos-x64/BZLobbyMonitor" "releases/BZLobbyMonitor"
+            chmod +x releases/BZLobbyMonitor
           fi
-          
-          # Copy Linux executable
-          if [ -f "release-artifacts/bzr_monitor-linux-x64/bzr_monitor" ]; then
-            cp "release-artifacts/bzr_monitor-linux-x64/bzr_monitor" "releases/bzr_monitor-linux-x64"
-            chmod +x releases/bzr_monitor-linux-x64
+
+          if [ -f "release-artifacts/Battlezone_LobbyMonitor-linux-x64/BZLobbyMonitor" ]; then
+            cp "release-artifacts/Battlezone_LobbyMonitor-linux-x64/BZLobbyMonitor" "releases/BZLobbyMonitor-linux"
+            chmod +x releases/BZLobbyMonitor-linux
           fi
-          
-          # Copy Python distributions
+
+          # Preserve the existing Python package identity for pip/CLI consumers.
           cp release-artifacts/python-distributions/*.whl releases/ 2>/dev/null || true
           cp release-artifacts/python-distributions/*.tar.gz releases/ 2>/dev/null || true
-          
-          # Create archives for executables
-          if [ -f "releases/bzr_monitor-windows-x64.exe" ]; then
-            cd releases && zip -q "bzr_monitor-${GITHUB_REF#refs/tags/}-windows-x64.zip" "bzr_monitor-windows-x64.exe" && cd ..
+
+          # Put versions on release archives, never on the executable itself.
+          if [ -f "releases/BZLobbyMonitor.exe" ]; then
+            cd releases && zip -q "Battlezone_LobbyMonitor-${GITHUB_REF_NAME}-windows-x64.zip" "BZLobbyMonitor.exe" && cd ..
           fi
-          
-          if [ -f "releases/bzr_monitor-macos-x64" ]; then
-            cd releases && tar -czf "bzr_monitor-${GITHUB_REF#refs/tags/}-macos-x64.tar.gz" "bzr_monitor-macos-x64" && cd ..
+
+          if [ -f "releases/BZLobbyMonitor" ]; then
+            cd releases && tar -czf "Battlezone_LobbyMonitor-${GITHUB_REF_NAME}-macos-x64.tar.gz" "BZLobbyMonitor" && cd ..
           fi
-          
-          if [ -f "releases/bzr_monitor-linux-x64" ]; then
-            cd releases && tar -czf "bzr_monitor-${GITHUB_REF#refs/tags/}-linux-x64.tar.gz" "bzr_monitor-linux-x64" && cd ..
+
+          if [ -f "releases/BZLobbyMonitor-linux" ]; then
+            cd releases && mv BZLobbyMonitor-linux BZLobbyMonitor && tar -czf "Battlezone_LobbyMonitor-${GITHUB_REF_NAME}-linux-x64.tar.gz" "BZLobbyMonitor" && rm BZLobbyMonitor && cd ..
           fi
-          
+
           echo "Final release artifacts:"
           ls -lh releases/
 
@@ -195,9 +199,9 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            releases/bzr_monitor-v*-windows-x64.zip
-            releases/bzr_monitor-v*-macos-x64.tar.gz
-            releases/bzr_monitor-v*-linux-x64.tar.gz
+            releases/Battlezone_LobbyMonitor-v*-windows-x64.zip
+            releases/Battlezone_LobbyMonitor-v*-macos-x64.tar.gz
+            releases/Battlezone_LobbyMonitor-v*-linux-x64.tar.gz
             releases/bzr_monitor-[0-9]*.whl
             releases/bzr_monitor-[0-9]*.tar.gz
           draft: false
