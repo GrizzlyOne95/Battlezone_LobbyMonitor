@@ -5,11 +5,14 @@ a = Analysis(
     ['bzr_monitor.py'],
     pathex=[],
     binaries=[],
-    datas=[('bzr_monitor_config.json', '.')],
+    datas=[
+        ('bzr_monitor_config.json', '.'),
+        ('branding/app_icon.png', 'branding'),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=['branding/pyinstaller_icon_hook.py'],
     excludes=[],
     noarchive=False,
     optimize=0,
@@ -35,5 +38,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='NONE',
+    icon='branding/app_icon.png',
 )
