@@ -3,6 +3,8 @@
 Setup script for Battlezone Redux Lobby Monitor
 """
 
+from pathlib import Path
+
 from setuptools import setup, find_packages
 
 with open("README.md", "r", encoding="utf-8") as fh:
@@ -13,7 +15,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="bzr-monitor",
-    version="1.2.3",
+    version=Path("VERSION").read_text(encoding="utf-8").strip(),
     author="GrizzlyOne95",
     description="A comprehensive external tool for monitoring Battlezone 98 Redux lobbies",
     long_description=long_description,
