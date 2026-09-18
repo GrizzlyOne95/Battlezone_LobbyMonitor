@@ -2,6 +2,8 @@ name: Build and Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
 
@@ -46,7 +48,12 @@ jobs:
       - name: Generate Windows version metadata
         if: matrix.os == 'Windows'
         run: |
-          python scripts/generate_version_info.py --version "${{ github.ref_name }}" --output branding/version_info.txt
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}"
+          } else {
+            $version = (Get-Content VERSION).Trim()
+          }
+          python scripts/generate_version_info.py --version "$version" --output branding/version_info.txt
 
       - name: Build executable (Windows)
         if: matrix.os == 'Windows'
@@ -143,6 +150,7 @@ jobs:
   create-release:
     name: Create Release
     needs: [build-exe, build-distributions]
+    if: "${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore(release): v')) }}"
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -150,12 +158,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve release tag
+        id: release_version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v$(tr -d '[:space:]' < VERSION)"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-artifacts
 
       - name: Organize artifacts
+        env:
+          RELEASE_TAG: ${{ steps.release_version.outputs.tag }}
         run: |
           mkdir -p releases
           ls -la release-artifacts/
@@ -181,23 +202,26 @@ jobs:
 
           # Put versions on release archives, never on the executable itself.
           if [ -f "releases/BZLobbyMonitor.exe" ]; then
-            cd releases && zip -q "Battlezone_LobbyMonitor-${GITHUB_REF_NAME}-windows-x64.zip" "BZLobbyMonitor.exe" && cd ..
+            cd releases && zip -q "Battlezone_LobbyMonitor-${RELEASE_TAG}-windows-x64.zip" "BZLobbyMonitor.exe" && cd ..
           fi
 
           if [ -f "releases/BZLobbyMonitor" ]; then
-            cd releases && tar -czf "Battlezone_LobbyMonitor-${GITHUB_REF_NAME}-macos-x64.tar.gz" "BZLobbyMonitor" && cd ..
+            cd releases && tar -czf "Battlezone_LobbyMonitor-${RELEASE_TAG}-macos-x64.tar.gz" "BZLobbyMonitor" && cd ..
           fi
 
           if [ -f "releases/BZLobbyMonitor-linux" ]; then
-            cd releases && mv BZLobbyMonitor-linux BZLobbyMonitor && tar -czf "Battlezone_LobbyMonitor-${GITHUB_REF_NAME}-linux-x64.tar.gz" "BZLobbyMonitor" && rm BZLobbyMonitor && cd ..
+            cd releases && mv BZLobbyMonitor-linux BZLobbyMonitor && tar -czf "Battlezone_LobbyMonitor-${RELEASE_TAG}-linux-x64.tar.gz" "BZLobbyMonitor" && rm BZLobbyMonitor && cd ..
           fi
 
           echo "Final release artifacts:"
           ls -lh releases/
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.release_version.outputs.tag }}
+          name: ${{ steps.release_version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: |
             releases/Battlezone_LobbyMonitor-v*-windows-x64.zip
             releases/Battlezone_LobbyMonitor-v*-macos-x64.tar.gz
