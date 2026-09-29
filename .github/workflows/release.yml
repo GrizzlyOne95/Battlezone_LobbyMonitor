@@ -6,10 +6,35 @@ on:
       - main
     tags:
       - 'v*'
+  pull_request:
 
 jobs:
+  test:
+    name: Tests and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyflakes
+
+      - name: Lint
+        run: python -m pyflakes bzr_monitor.py bzr_monitor_utils.py tests scripts
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
   build-exe:
     name: Build ${{ matrix.os }}
+    needs: test
+    if: github.event_name == 'push'
     runs-on: ${{ matrix.os-version }}
     strategy:
       matrix:
@@ -20,7 +45,7 @@ jobs:
             output-path: dist/BZLobbyMonitor.exe
           - os: macOS
             os-version: macos-latest
-            artifact-name: Battlezone_LobbyMonitor-macos-x64
+            artifact-name: Battlezone_LobbyMonitor-macos-arm64
             output-path: dist/BZLobbyMonitor
           - os: Linux
             os-version: ubuntu-latest
@@ -69,7 +94,9 @@ jobs:
             --hidden-import=websocket `
             --hidden-import=pystray `
             --hidden-import=pypresence `
-            --hidden-import=pysocks `
+            --hidden-import=socks `
+            --hidden-import=sockshandler `
+            --hidden-import=python_socks `
             --hidden-import=PIL `
             bzr_monitor.py -y
 
@@ -86,7 +113,9 @@ jobs:
             --hidden-import=websocket \
             --hidden-import=pystray \
             --hidden-import=pypresence \
-            --hidden-import=pysocks \
+            --hidden-import=socks \
+            --hidden-import=sockshandler \
+            --hidden-import=python_socks \
             --hidden-import=PIL \
             bzr_monitor.py -y
 
@@ -104,7 +133,9 @@ jobs:
             --hidden-import=websocket \
             --hidden-import=pystray \
             --hidden-import=pypresence \
-            --hidden-import=pysocks \
+            --hidden-import=socks \
+            --hidden-import=sockshandler \
+            --hidden-import=python_socks \
             --hidden-import=PIL \
             bzr_monitor.py -y
 
@@ -122,6 +153,8 @@ jobs:
 
   build-distributions:
     name: Build Python distributions
+    needs: test
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -186,8 +219,8 @@ jobs:
             cp "release-artifacts/Battlezone_LobbyMonitor-windows-x64/BZLobbyMonitor.exe" "releases/BZLobbyMonitor.exe"
           fi
 
-          if [ -f "release-artifacts/Battlezone_LobbyMonitor-macos-x64/BZLobbyMonitor" ]; then
-            cp "release-artifacts/Battlezone_LobbyMonitor-macos-x64/BZLobbyMonitor" "releases/BZLobbyMonitor"
+          if [ -f "release-artifacts/Battlezone_LobbyMonitor-macos-arm64/BZLobbyMonitor" ]; then
+            cp "release-artifacts/Battlezone_LobbyMonitor-macos-arm64/BZLobbyMonitor" "releases/BZLobbyMonitor"
             chmod +x releases/BZLobbyMonitor
           fi
 
@@ -206,7 +239,7 @@ jobs:
           fi
 
           if [ -f "releases/BZLobbyMonitor" ]; then
-            cd releases && tar -czf "Battlezone_LobbyMonitor-${RELEASE_TAG}-macos-x64.tar.gz" "BZLobbyMonitor" && cd ..
+            cd releases && tar -czf "Battlezone_LobbyMonitor-${RELEASE_TAG}-macos-arm64.tar.gz" "BZLobbyMonitor" && cd ..
           fi
 
           if [ -f "releases/BZLobbyMonitor-linux" ]; then
@@ -224,7 +257,7 @@ jobs:
           target_commitish: ${{ github.sha }}
           files: |
             releases/Battlezone_LobbyMonitor-v*-windows-x64.zip
-            releases/Battlezone_LobbyMonitor-v*-macos-x64.tar.gz
+            releases/Battlezone_LobbyMonitor-v*-macos-arm64.tar.gz
             releases/Battlezone_LobbyMonitor-v*-linux-x64.tar.gz
             releases/bzr_monitor-[0-9]*.whl
             releases/bzr_monitor-[0-9]*.tar.gz
