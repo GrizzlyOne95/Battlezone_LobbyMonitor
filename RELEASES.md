@@ -1,5 +1,12 @@
 # Battlezone Redux Lobby Monitor - Release Instructions
 
+## Automated Releases
+
+GitHub Actions publishes a release when a push to `main` changes `VERSION` to a version
+that has no `v<version>` tag yet (or when a `v*` tag is pushed). To release, bump `VERSION`
+and merge to `main`; the workflow builds Windows, macOS and Linux executables plus the
+Python distributions, tags `v<version>`, and creates the GitHub Release.
+
 ## Release Build Process
 
 This document describes how to build releases for all platforms.
