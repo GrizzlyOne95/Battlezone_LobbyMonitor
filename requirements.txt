@@ -1,5 +1,6 @@
 websocket-client
-Pillow
+Pillow>=9.1
 pypresence
 pysocks
+python-socks
 pystray

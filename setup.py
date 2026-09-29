@@ -31,7 +31,7 @@ setup(
         "Intended Audience :: End Users/Desktop",
         "Topic :: Games/Entertainment",
     ],
-    python_requires=">=3.6",
+    python_requires=">=3.8",
     install_requires=requirements,
     entry_points={
         "console_scripts": [

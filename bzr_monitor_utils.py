@@ -352,12 +352,17 @@ def build_bzcc_lobby(game):
         return None
 
     map_name = game.get("m", "Unknown")
+    # BZCC lobby server fields: "k" = password protected, "l" = locked
+    # (game started / host locked). Either one means the game can't simply be joined.
     passworded = str(game.get("k")) == "1"
+    locked = str(game.get("l")) == "1"
     mod_list = game.get("mm")
     users = {}
     for player in game.get("pl") or []:
+        if not isinstance(player, dict):
+            continue
         pid = player.get("i", "Unknown")
-        users[pid] = {
+        users[str(pid)] = {
             "name": decode_bzcc_name(player.get("n") or ""),
             "id": pid,
             "team": player.get("t"),
@@ -390,12 +395,13 @@ def build_bzcc_lobby(game):
             "mapModCrc": game.get("mm"),
             "hostMessage": game.get("h", ""),
             "passwordProtected": passworded,
+            "locked": locked,
             "tps": game.get("tps"),
         },
         "users": users,
         "memberLimit": game.get("pm", 0),
-        "isLocked": passworded,
-        "isPrivate": str(game.get("l")) == "1",
+        "isLocked": locked or passworded,
+        "isPrivate": passworded,
         "owner": users[next(iter(users))]["id"] if users else "Unknown",
     }
     return str(lid), lobby
@@ -416,6 +422,11 @@ def should_relay_discord_message(
     if str(current_lobby_id) != str(target_lobby_id):
         return None
 
+    # Without the bot's own id we cannot tell our relayed posts apart from
+    # user messages, which would echo lobby chat back into the lobby.
+    if not bot_id:
+        return None
+
     if message.get("webhook_id"):
         return None
 
@@ -423,8 +434,8 @@ def should_relay_discord_message(
     if not content:
         return None
 
-    author = message.get("author", {})
-    if author.get("id") == bot_id:
+    author = message.get("author") or {}
+    if str(author.get("id")) == str(bot_id):
         return None
 
     sender = author.get("username") or "Discord"
@@ -555,6 +566,25 @@ def parse_bz2_unconnected_pong(data):
         return None
 
 
+RAKNET_RELIABLE = {2, 3, 4, 6, 7}
+RAKNET_SEQUENCED = {1, 4}
+RAKNET_ORDERED_OR_SEQUENCED = {1, 3, 4, 7}
+
+
+def raknet_frame_header_extra(reliability, is_split):
+    """Bytes between a frame's length field and its payload."""
+    extra = 0
+    if reliability in RAKNET_RELIABLE:
+        extra += 3  # reliable message number
+    if reliability in RAKNET_SEQUENCED:
+        extra += 3  # sequencing index
+    if reliability in RAKNET_ORDERED_OR_SEQUENCED:
+        extra += 4  # ordering index (3) + ordering channel (1)
+    if is_split:
+        extra += 10  # split count (4) + split id (2) + split index (4)
+    return extra
+
+
 def parse_raknet_frames(data):
     try:
         frames = []
@@ -571,14 +601,7 @@ def parse_raknet_frames(data):
             offset += 2
             length_bytes = (length_bits + 7) // 8
 
-            if reliability in [2, 3, 4]:
-                offset += 3
-            if reliability in [1, 4]:
-                offset += 4
-            if reliability == 3:
-                offset += 4
-            if is_split:
-                offset += 10
+            offset += raknet_frame_header_extra(reliability, is_split)
 
             if offset + length_bytes > len(data):
                 break
@@ -587,3 +610,38 @@ def parse_raknet_frames(data):
         return frames
     except Exception:
         return []
+
+
+def build_discord_message_payload(message=None, embed=None):
+    """Discord message body that never pings anyone.
+
+    Relayed lobby chat is untrusted: without allowed_mentions a player could
+    make the bot ping @everyone, @here or roles.
+    """
+    payload = {"allowed_mentions": {"parse": []}}
+    if message:
+        payload["content"] = str(message)[:2000]
+    if embed:
+        payload["embeds"] = [embed]
+    return payload
+
+
+SAFE_LINK_SCHEMES = ("http://", "https://", "steam://")
+
+
+def is_safe_link(url):
+    """Only let clickable links open web pages or Steam URLs."""
+    return isinstance(url, str) and url.lower().startswith(SAFE_LINK_SCHEMES)
+
+
+def parse_id_list(text):
+    """Split a newline-separated list into stripped, lower-cased entries."""
+    if not text:
+        return []
+    return [line.strip().lower() for line in str(text).splitlines() if line.strip()]
+
+
+def list_matches(entries, *values):
+    """True if any value contains any of the (lower-cased) entries."""
+    haystacks = [str(v).lower() for v in values if v not in (None, "")]
+    return any(entry in hay for entry in entries for hay in haystacks)

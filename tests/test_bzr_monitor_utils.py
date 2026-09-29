@@ -312,5 +312,14 @@ class RakNetParsingTests(unittest.TestCase):
         self.assertIsNone(chat_line)
 
 
+class FormatAgeTests(unittest.TestCase):
+    def test_format_age_units(self):
+        now = datetime(2026, 3, 20, 12, 0, 0)
+        self.assertEqual(format_age(now - timedelta(seconds=30), now=now), "30s")
+        self.assertEqual(format_age(now - timedelta(minutes=5), now=now), "5m")
+        self.assertEqual(format_age(now - timedelta(hours=2), now=now), "2h")
+        self.assertEqual(format_age(None), "?")
+
+
 if __name__ == "__main__":
     unittest.main()
