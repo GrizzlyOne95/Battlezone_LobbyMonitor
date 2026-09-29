@@ -19,26 +19,33 @@ import os
 import csv
 import ctypes
 import random
+import queue
+import importlib.util
+import hashlib
+import ipaddress
+import traceback
+import urllib.error
 from datetime import datetime, timedelta
 import tarfile
-import zipfile
 import subprocess
-import shutil
-import base64
 
 from bzr_monitor_utils import (
+    aggregate_recent_player_counts,
+    build_bzcc_lobby,
+    build_discord_message_payload,
     build_lobby_share_text,
     build_steam_join_url,
+    clean_lobby_name,
     extract_map_name_from_game_settings,
     extract_map_name_from_metadata,
     format_game_settings_summary,
-    get_lobby_age_label,
-    get_lobby_network_label,
-    get_lobby_source,
-    get_lobby_status_flags,
-    is_lobby_stale,
+    is_safe_link,
+    list_matches,
     parse_game_settings,
-    stamp_lobby,
+    parse_id_list,
+    parse_raknet_frames,
+    raknet_frame_header_extra,
+    should_relay_discord_message,
 )
 
 if sys.platform == "win32":
@@ -47,10 +54,12 @@ if sys.platform == "win32":
 
 try:
     import pystray
-    from pystray import MenuItem as item, Icon
+    from pystray import MenuItem as item
 
     HAS_TRAY = True
-except ImportError:
+except Exception:
+    # pystray raises ValueError (not ImportError) when no tray backend such
+    # as GTK is available, e.g. on minimal Linux desktops.
     HAS_TRAY = False
 
 # Try to import pypresence for Discord RPC
@@ -83,7 +92,28 @@ try:
 except ImportError:
     HAS_PIL = False
 
-CONFIG_FILE = "bzr_monitor_config.json"
+def _app_dir():
+    """Directory next to the script (or the frozen executable).
+
+    Deliberately not the current working directory: when Windows launches the
+    app from the Run registry key the CWD is usually System32, and in a
+    PyInstaller one-file build __file__ lives in a temp dir deleted on exit.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+APP_DIR = _app_dir()
+CONFIG_NAME = "bzr_monitor_config.json"
+CONFIG_FILE = os.path.join(APP_DIR, CONFIG_NAME)
+DEFAULT_GRIEFER_IDS = "S76561198297657246"
+TOR_DOWNLOAD_PAGE = "https://www.torproject.org/download/tor/"
+HTTP_TIMEOUT = 10
+
+# websocket-client needs python-socks (not pysocks) for SOCKS proxies.
+HAS_PYTHON_SOCKS = importlib.util.find_spec("python_socks") is not None
+
 APP_USER_MODEL_ID = "GrizzlyOne95.Battlezone.LobbyMonitor"
 
 
@@ -162,11 +192,23 @@ class BZLobbyMonitor:
 
         apply_window_icon(self.root)
 
+        # Every Tk call must happen on the main thread. Worker threads hand
+        # work over through this queue (see call_in_ui).
+        self.ui_queue = queue.Queue()
+        self.root.after(50, self._drain_ui_queue)
+
         self.lobbies = {}
         self.ws = None
         self.ws_thread = None
         self.connected = False
-        self.should_run = True
+        self.app_running = True  # lifetime of the app (background loops)
+        self.should_run = False  # the user wants a lobby connection
+        self.conn_gen = 0  # bumped per connect/disconnect to retire old workers
+        self.reconnect_after_id = None
+        self.http_poll_inflight = False
+        self.stats_after_id = None
+        self.stats_loading = False
+        self.stats_points = None
         self.current_lobby_id = None
         self.my_id = None
         self.image_cache = {}
@@ -175,6 +217,9 @@ class BZLobbyMonitor:
         self.discord_thread = None
         self.muted_users = set()
         self.geo_cache = {}
+        self.geo_pending = set()
+        self.geo_failed = {}
+        self.image_failed = {}
         self.rpc = None
         self.last_announce_time = time.time()
         self.last_event_announce_time = 0
@@ -195,8 +240,10 @@ class BZLobbyMonitor:
         # Start stats logger if enabled
         if self.config.get("stats_enabled", False):
             self.start_stats_logger()
+            self.root.after(500, self.draw_stats)
         self.start_proxy_monitor()
         self.start_bot_loop()
+        self.cleanup_logs()
 
         if HAS_RPC and self.config.get("rpc_enabled", False):
             self.init_rpc()
@@ -266,13 +313,19 @@ class BZLobbyMonitor:
             "sound_join": "",
             "sound_mention": "",
             "sound_griefer": "",
+            "griefer_ids": DEFAULT_GRIEFER_IDS,
         }
-        if os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, "r") as f:
-                    self.config.update(json.load(f))
-            except:
-                pass
+        # Older versions kept the config in the working directory.
+        for path in (CONFIG_FILE, os.path.abspath(CONFIG_NAME)):
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        self.config.update(loaded)
+                    break
+                except Exception as e:
+                    print(f"Failed to load config {path}: {e}", file=sys.stderr)
 
     def load_custom_fonts(self):
         self.custom_font_name = "Consolas"
@@ -284,7 +337,7 @@ class BZLobbyMonitor:
                 try:
                     if ctypes.windll.gdi32.AddFontResourceExW(font_path, 0x10, 0) > 0:
                         self.custom_font_name = "BZONE"
-                except:
+                except Exception:
                     pass
         else:
             self.custom_font_name = "Monospace"
@@ -380,15 +433,78 @@ class BZLobbyMonitor:
                     button.config(text=original_text) if button.winfo_exists() else None
                 ),
             )
-        except:
+        except Exception:
             pass
 
     def save_config(self):
+        # Write to a temp file and swap it in so a crash mid-write can't
+        # leave a truncated config behind.
+        tmp_path = CONFIG_FILE + ".tmp"
         try:
-            with open(CONFIG_FILE, "w") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=4)
-        except:
-            pass
+            os.replace(tmp_path, CONFIG_FILE)
+        except Exception as e:
+            print(f"Failed to save config: {e}", file=sys.stderr)
+
+    # --- Thread helpers ---
+    def call_in_ui(self, fn, *args, delay_ms=0):
+        """Run fn(*args) on the Tk main thread. Safe to call from any thread."""
+        self.ui_queue.put((fn, args, delay_ms))
+
+    def _drain_ui_queue(self):
+        while True:
+            try:
+                fn, args, delay_ms = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if delay_ms:
+                    self.root.after(delay_ms, fn, *args)
+                else:
+                    fn(*args)
+            except Exception:
+                traceback.print_exc()
+        try:
+            self.root.after(50, self._drain_ui_queue)
+        except tk.TclError:
+            pass  # window destroyed
+
+    def _conn_active(self, gen):
+        return self.should_run and gen == self.conn_gen
+
+    @staticmethod
+    def _get_int(var, default):
+        try:
+            return int(var.get())
+        except (tk.TclError, ValueError, TypeError):
+            return default
+
+    def open_url(self, req, timeout=HTTP_TIMEOUT):
+        """urlopen that honours the proxy / IP Safety settings."""
+        return self._build_url_opener().open(req, timeout=timeout)
+
+    def _build_url_opener(self):
+        cfg = self.config
+        host = str(cfg.get("proxy_host", "")).strip()
+        port = str(cfg.get("proxy_port", "")).strip()
+        if cfg.get("proxy_enabled") and host and port:
+            if cfg.get("proxy_type") == "socks5":
+                try:
+                    import socks
+                    import sockshandler
+                except ImportError:
+                    raise ConnectionError("SOCKS proxy requires 'pysocks'")
+                return urllib.request.build_opener(
+                    sockshandler.SocksiPyHandler(socks.SOCKS5, host, int(port), rdns=True)
+                )
+            proxy = f"http://{host}:{port}"
+            return urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            )
+        if cfg.get("ip_safety"):
+            raise ConnectionError("IP Safety is on but no proxy is configured")
+        return urllib.request.build_opener()
 
     def setup_ui(self):
         self.notebook = ttk.Notebook(self.root)
@@ -777,7 +893,7 @@ class BZLobbyMonitor:
         self.proxy_enabled_var = tk.BooleanVar(value=self.config["proxy_enabled"])
         ttk.Checkbutton(
             proxy_frame,
-            text="Enable Proxy Connection (BZ98R WebSocket Only)",
+            text="Enable Proxy (BZ98R WebSocket + web lookups; BZCC UDP is never proxied)",
             variable=self.proxy_enabled_var,
             command=self.save_ui_config,
         ).pack(anchor="w")
@@ -785,7 +901,7 @@ class BZLobbyMonitor:
         self.ip_safety_var = tk.BooleanVar(value=self.config.get("ip_safety", False))
         ttk.Checkbutton(
             proxy_frame,
-            text="IP Safety (Block connection if proxy fails)",
+            text="IP Safety (Block connections and lookups that can't use a working proxy)",
             variable=self.ip_safety_var,
             command=self.save_ui_config,
         ).pack(anchor="w")
@@ -957,7 +1073,7 @@ class BZLobbyMonitor:
         )
         ttk.Checkbutton(
             alert_frame,
-            text="Alert on CaptChoes (Known Griefer/Troll)",
+            text="Alert on Known Griefers (IDs under Security & Auto-Ban)",
             variable=self.alert_griefer_var,
             command=self.save_ui_config,
         ).pack(anchor="w")
@@ -1029,6 +1145,21 @@ class BZLobbyMonitor:
         )
         self.ban_list_text.pack(fill="x", pady=(0, 5))
         self.ban_list_text.insert("1.0", self.config.get("ban_list", ""))
+
+        ttk.Label(
+            sec_frame, text="Known Griefer IDs (for griefer alerts - one per line):"
+        ).pack(anchor="w")
+        self.griefer_ids_text = tk.Text(
+            sec_frame,
+            height=3,
+            width=40,
+            bg="#1a1a1a",
+            fg="#ff5555",
+            insertbackground=self.colors["highlight"],
+            font=("Consolas", 9),
+        )
+        self.griefer_ids_text.pack(fill="x", pady=(0, 5))
+        self.griefer_ids_text.insert("1.0", self.config.get("griefer_ids", ""))
 
         ttk.Label(social_frame, text="Custom Audio Alerts (.wav):").pack(
             anchor="w", pady=(5, 0)
@@ -1337,7 +1468,8 @@ class BZLobbyMonitor:
 
         self.stats_canvas = tk.Canvas(container, bg="#1a1a1a", highlightthickness=0)
         self.stats_canvas.pack(fill="both", expand=True)
-        self.stats_canvas.bind("<Configure>", lambda e: self.draw_stats())
+        # Resizes just redraw the cached points; the file is read on demand.
+        self.stats_canvas.bind("<Configure>", lambda e: self._render_stats())
 
     def setup_about_tab(self):
         container = ttk.Frame(self.about_tab, padding=40)
@@ -1392,174 +1524,17 @@ class BZLobbyMonitor:
 
         self.tree.heading(col, command=lambda: self.sort_tree(col, not reverse))
 
-    def sort_player_tree(self, col, reverse):
-        rows = [(self.player_tree.set(k, col), k) for k in self.player_tree.get_children('')]
-        try:
-            rows.sort(key=lambda t: int(t[0]) if str(t[0]).lstrip("-").isdigit() else str(t[0]).lower(), reverse=reverse)
-        except ValueError:
-            rows.sort(key=lambda t: str(t[0]).lower(), reverse=reverse)
-
-        for index, (_, item_id) in enumerate(rows):
-            self.player_tree.move(item_id, '', index)
-
-        self.player_tree.heading(col, command=lambda: self.sort_player_tree(col, not reverse))
-
-    def get_relay_enabled_flag(self):
-        if isinstance(self.last_relay_status, dict):
-            return self.last_relay_status.get("enabled")
-        return None
-
-    def mark_lobby_seen(self, lobby, source):
-        if isinstance(lobby, dict):
-            stamp_lobby(lobby, source)
-        return lobby
-
-    def set_lobby_badge(self, key, text, fg=None, bg=None):
-        label = self.lobby_badges.get(key)
-        if not label:
-            return
-        label.config(
-            text=text,
-            fg=fg or self.colors["fg"],
-            bg=bg or "#1a1a1a",
-        )
-
-    def update_lobby_badges(self, lobby):
-        relay_enabled = self.get_relay_enabled_flag()
-        source = get_lobby_source(lobby, default="Source: ?")
-        age_text = get_lobby_age_label(lobby, default="?")
-        last_seen = get_lobby_last_seen(lobby)
-        freshness_text = f"Seen {age_text}"
-        if last_seen:
-            freshness_text = f"{freshness_text} ago"
-        is_stale = is_lobby_stale(lobby)
-        network_text = get_lobby_network_label(lobby, default="-")
-        status_flags = get_lobby_status_flags(lobby, relay_status=relay_enabled)
-        relay_text = "Relay ?" if relay_enabled is None else ("Relay On" if relay_enabled else "Relay Off")
-
-        self.set_lobby_badge("source", source, bg="#15313a")
-        self.set_lobby_badge("freshness", freshness_text, bg="#3a2f15" if is_stale else "#153a20")
-        self.set_lobby_badge("state", " | ".join(status_flags[:3]) if status_flags else "State: Normal", bg="#2a1f3a")
-        self.set_lobby_badge("network", network_text, bg="#1f1f3a")
-        relay_bg = "#2a2a2a" if relay_enabled is None else ("#203a35" if relay_enabled else "#3a2020")
-        self.set_lobby_badge("relay", relay_text, bg=relay_bg)
-
-    def start_periodic_ui_refresh(self):
-        self.root.after(5000, self._periodic_ui_refresh)
-
-    def _periodic_ui_refresh(self):
-        if not self.root.winfo_exists():
-            return
-        try:
-            if self.lobbies:
-                self.refresh_tree()
-                self.on_lobby_select(None)
-        finally:
-            if self.root.winfo_exists():
-                self.root.after(5000, self._periodic_ui_refresh)
-
-    def clear_player_meta(self, message="Select a player for details."):
-        self.player_meta_text.config(state="normal")
-        self.player_meta_text.delete("1.0", "end")
-        self.player_meta_text.insert("end", message)
-        self.player_meta_text.config(state="disabled")
-
-    def get_selected_player_context(self):
-        selected = self.player_tree.selection()
-        if not selected:
-            return None, None
-
-        uid = str(self.player_tree.item(selected[0])["values"][1])
-        if self.current_lobby_id is None:
-            return uid, None
-
-        lobby = self.lobbies.get(str(self.current_lobby_id))
-        if not lobby:
-            return uid, None
-
-        user = lobby.get("users", {}).get(uid)
-        if user is None:
-            for alt_uid, alt_user in lobby.get("users", {}).items():
-                if str(alt_uid) == uid:
-                    user = alt_user
-                    uid = str(alt_uid)
-                    break
-        return uid, user
-
-    def on_player_select(self, event=None):
-        uid, user = self.get_selected_player_context()
-        if uid is None or user is None:
-            self.clear_player_meta()
-            return
-        self.render_selected_player_meta(uid, user)
-
-    def render_selected_player_meta(self, uid, user):
-        user = self.get_enriched_user(uid, user)
-        user_meta = user.get("metadata", {}) if isinstance(user, dict) else {}
-        ip = user.get("ipAddress")
-        geo = self.get_geo_info(ip) if ip and ip != "unknown" else None
-
-        self.player_meta_text.config(state="normal")
-        self.player_meta_text.delete("1.0", "end")
-        self.player_meta_text.insert("end", f"Name: {user.get('name', 'Unknown')}\n")
-        self.player_meta_text.insert("end", f"ID: {uid}\n")
-        self.player_meta_text.insert("end", f"Auth: {user.get('authType', '')}\n")
-        self.player_meta_text.insert("end", f"IP: {ip or ''}\n")
-        if geo:
-            self.player_meta_text.insert("end", f"Geo: {geo}\n")
-        if user.get("clientVersion") is not None:
-            self.player_meta_text.insert("end", f"Client: {user.get('clientVersion')}\n")
-        if user.get("isAdmin") is not None:
-            self.player_meta_text.insert("end", f"Admin: {user.get('isAdmin')}\n")
-        if user.get("isInLounge") is not None:
-            self.player_meta_text.insert("end", f"In Lounge: {user.get('isInLounge')}\n")
-        if user.get("wanAddress") and user.get("wanAddress") != "unknown":
-            self.player_meta_text.insert("end", f"WAN: {user.get('wanAddress')}\n")
-        lans = user.get("lanAddresses")
-        if lans:
-            lan_text = ", ".join(lans) if isinstance(lans, list) else str(lans)
-            self.player_meta_text.insert("end", f"LAN: {lan_text}\n")
-        if user.get("lobby") is not None:
-            self.player_meta_text.insert("end", f"Lobby: {user.get('lobby')}\n")
-        team = user_meta.get("team", user.get("team"))
-        if team not in [None, ""]:
-            self.player_meta_text.insert("end", f"Team: {team}\n")
-        score = user_meta.get("score", user.get("score"))
-        if score not in [None, ""]:
-            self.player_meta_text.insert("end", f"Score: {score}\n")
-        kills = user_meta.get("kills", user.get("kills"))
-        if kills not in [None, ""]:
-            self.player_meta_text.insert("end", f"Kills: {kills}\n")
-        deaths = user_meta.get("deaths", user.get("deaths"))
-        if deaths not in [None, ""]:
-            self.player_meta_text.insert("end", f"Deaths: {deaths}\n")
-        if uid.startswith("S"):
-            steam_id = uid[1:]
-            self.player_meta_text.insert("end", "Profile: ")
-            self.insert_link(self.player_meta_text, steam_id, f"https://steamcommunity.com/profiles/{steam_id}")
-            self.player_meta_text.insert("end", "\n")
-
-        if user_meta:
-            self.player_meta_text.insert("end", "\nMetadata:\n")
-            known_meta = {"team", "vehicle", "ready", "launched", "name", "score", "kills", "deaths"}
-            for mk in sorted(user_meta.keys()):
-                if mk in known_meta:
-                    continue
-                self.player_meta_text.insert("end", f" - {mk}: {self._fmt_compact_value(user_meta.get(mk))}\n")
-
-        self.player_meta_text.config(state="disabled")
-
     def save_ui_config(self):
         self.config["proxy_enabled"] = self.proxy_enabled_var.get()
         self.config["ip_safety"] = self.ip_safety_var.get()
         self.config["auto_reconnect"] = self.auto_reconnect_var.get()
-        self.config["reconnect_delay"] = self.reconnect_delay_var.get()
+        self.config["reconnect_delay"] = self._get_int(self.reconnect_delay_var, 10)
         self.config["proxy_host"] = self.proxy_host_var.get()
         self.config["proxy_port"] = self.proxy_port_var.get()
         # proxy_type is managed by buttons, not directly exposed in this UI save
         self.config["minimize_on_close"] = self.min_close_var.get()
         self.config["logging_enabled"] = self.log_enabled_var.get()
-        self.config["log_retention"] = self.log_ret_var.get()
+        self.config["log_retention"] = self._get_int(self.log_ret_var, 7)
         self.config["stats_enabled"] = self.stats_enabled_var.get()
         self.config["alert_new_lobby"] = self.alert_new_lobby_var.get()
         self.config["alert_player_join"] = self.alert_player_join_var.get()
@@ -1570,6 +1545,7 @@ class BZLobbyMonitor:
         self.config["watch_list"] = self.watch_list_text.get("1.0", "end-1c")
         self.config["friend_list"] = self.friend_list_text.get("1.0", "end-1c")
         self.config["ban_list"] = self.ban_list_text.get("1.0", "end-1c")
+        self.config["griefer_ids"] = self.griefer_ids_text.get("1.0", "end-1c")
         self.config["sound_join"] = self.sound_join_var.get()
         self.config["sound_mention"] = self.sound_mention_var.get()
         self.config["sound_griefer"] = self.sound_griefer_var.get()
@@ -1586,15 +1562,15 @@ class BZLobbyMonitor:
         self.config["discord_relay_to_lobby"] = self.discord_to_lobby_var.get()
         self.config["bot_enabled"] = self.bot_enabled_var.get()
         self.config["bot_welcome_msg"] = self.bot_welcome_var.get()
-        self.config["bot_welcome_cooldown"] = self.bot_welcome_cooldown_var.get()
+        self.config["bot_welcome_cooldown"] = self._get_int(self.bot_welcome_cooldown_var, 60)
         self.config["bot_announce_enabled"] = self.bot_announce_enabled_var.get()
         self.config["bot_announce_msg"] = self.bot_announce_msg_var.get()
-        self.config["bot_announce_interval"] = self.bot_announce_int_var.get()
+        self.config["bot_announce_interval"] = self._get_int(self.bot_announce_int_var, 5)
         self.config["bot_event_enabled"] = self.bot_event_enabled_var.get()
         self.config["bot_event_msg"] = self.bot_event_msg_var.get()
         self.config["bot_event_start"] = self.bot_event_start_var.get()
         self.config["bot_event_end"] = self.bot_event_end_var.get()
-        self.config["bot_event_interval"] = self.bot_event_int_var.get()
+        self.config["bot_event_interval"] = self._get_int(self.bot_event_int_var, 10)
         self.config["auto_claim_enabled"] = self.auto_claim_enabled_var.get()
         self.config["auto_claim_name"] = self.auto_claim_name_var.get()
         self.config["auto_claim_bot_name"] = self.auto_claim_bot_name_var.get()
@@ -1648,9 +1624,9 @@ class BZLobbyMonitor:
                     if not os.path.exists(autostart_dir):
                         os.makedirs(autostart_dir)
                     exec_cmd = (
-                        sys.executable
+                        f'"{sys.executable}"'
                         if getattr(sys, "frozen", False)
-                        else f"{sys.executable} {os.path.abspath(sys.argv[0])}"
+                        else f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
                     )
                     content = f"[Desktop Entry]\nType=Application\nName=Battlezone Lobby Monitor\nExec={exec_cmd}\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true\nComment=Start BZR Monitor\n"
                     with open(desktop_file, "w") as f:
@@ -1706,7 +1682,7 @@ class BZLobbyMonitor:
                 try:
                     winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
                     played = True
-                except:
+                except Exception:
                     pass
 
         if not played:
@@ -1716,16 +1692,18 @@ class BZLobbyMonitor:
         if sys.platform == "win32":
             try:
                 ctypes.windll.user32.FlashWindow(int(self.root.wm_frame(), 16), True)
-            except:
+            except Exception:
                 pass
         else:
             try:
                 self.root.wm_attributes("-demands-attention", True)
-            except:
+            except Exception:
                 pass
 
     def quit_app(self):
+        self.app_running = False
         self.should_run = False
+        self.conn_gen += 1
         if self.tray_icon:
             self.tray_icon.stop()
         if self.tor_process:
@@ -1746,10 +1724,10 @@ class BZLobbyMonitor:
             return
 
         def show_window(icon, item):
-            self.root.after(0, self.root.deiconify)
+            self.call_in_ui(self.root.deiconify)
 
         def quit_tray(icon, item):
-            self.root.after(0, self.quit_app)
+            self.call_in_ui(self.quit_app)
 
         image = None
         if HAS_PIL:
@@ -1911,7 +1889,7 @@ class BZLobbyMonitor:
 
                 menu.post(event.x_root, event.y_root)
         except Exception as e:
-            pass
+            print(f"Context menu error: {e}")
 
     def add_to_watch_list(self, text):
         current = self.watch_list_text.get("1.0", "end-1c")
@@ -1937,8 +1915,11 @@ class BZLobbyMonitor:
         self.save_ui_config()
 
     def whisper_user(self, name):
+        if not (self.ws and self.connected):
+            self.log("Whisper failed: not connected.")
+            return
         msg = simpledialog.askstring("Whisper", f"Message to {name}:")
-        if msg:
+        if msg and self.ws and self.connected:
             # BZ98R uses /t for tell/whisper usually
             self.ws.send(
                 json.dumps({"type": "DoSendChat", "content": f"/t {name} {msg}"})
@@ -1955,6 +1936,9 @@ class BZLobbyMonitor:
             self.log(f"Muted {name}")
 
     def kick_user(self, uid, name):
+        if not (self.ws and self.connected):
+            self.log("Kick failed: not connected.")
+            return
         if messagebox.askyesno("Kick User", f"Are you sure you want to kick {name}?"):
             self.ws.send(
                 json.dumps(
@@ -1972,7 +1956,7 @@ class BZLobbyMonitor:
             return
 
         if self.current_lobby_id is not None:
-            msg = {"type": "DoExitLobby", "content": self.current_lobby_id}
+            msg = {"type": "DoExitLobby", "content": self._server_lobby_id(self.current_lobby_id)}
             self.log(f"Requesting Exit Lobby: {self.current_lobby_id}")
         else:
             msg = {"type": "DoEnterLounge", "content": True}
@@ -2018,7 +2002,10 @@ class BZLobbyMonitor:
             for tag in tags:
                 if tag.startswith("url:"):
                     url = tag[4:]
-                    webbrowser.open(url)
+                    if is_safe_link(url):
+                        webbrowser.open(url)
+                    else:
+                        self.log(f"Blocked non-web link: {url}")
         except Exception as e:
             self.log(f"Error opening link: {e}")
 
@@ -2026,10 +2013,10 @@ class BZLobbyMonitor:
         widget.insert("end", text, ("link", f"url:{url}"))
 
     def log(self, message):
-        self.root.after(0, lambda: self._log_impl(message))
+        self.call_in_ui(lambda: self._log_impl(message))
 
     def log_chat(self, author, text):
-        self.root.after(0, lambda: self._log_chat_impl(author, text))
+        self.call_in_ui(lambda: self._log_chat_impl(author, text))
 
     def _log_chat_impl(self, author, text):
         self.log_text.config(state="normal")
@@ -2076,87 +2063,181 @@ class BZLobbyMonitor:
 
     def _file_log(self, message):
         try:
-            folder = self.config.get("log_folder", "")
-            if not folder or not os.path.exists(folder):
-                folder = "."
+            folder = self.get_log_folder()
             filename = os.path.join(
                 folder, f"bzr_log_{datetime.now().strftime('%Y-%m-%d')}.txt"
             )
             timestamp = datetime.now().strftime("[%H:%M:%S]")
             with open(filename, "a", encoding="utf-8") as f:
                 f.write(f"{timestamp} {message}\n")
-        except:
+        except Exception:
             pass
 
     def toggle_connection(self):
-        if self.connected:
+        # should_run covers "connecting" and "waiting to reconnect" too, so a
+        # second click can never start a duplicate worker.
+        if self.should_run:
             self.disconnect()
         else:
             self.connect()
 
     def connect(self):
-        host = self.host_var.get()
+        self._cancel_reconnect()
+        host = self.host_var.get().strip()
         if not host:
             messagebox.showerror("Error", "Host is required")
             return
 
+        game = self.game_var.get()
+        if game == "Battlezone 98 Redux":
+            mode = "ws"
+        elif host.startswith("http"):
+            mode = "http"
+        else:
+            mode = "udp"
+
+        proxy_on = self.config.get("proxy_enabled", False)
+        p_host = str(self.config.get("proxy_host", "")).strip()
+        p_port = str(self.config.get("proxy_port", "")).strip()
+        p_type = self.config.get("proxy_type", "http")
+
+        if mode == "ws" and proxy_on and p_type == "socks5" and not HAS_PYTHON_SOCKS:
+            messagebox.showerror(
+                "Missing Dependency",
+                "SOCKS proxies (Tor) need the 'python-socks' package.\n"
+                "Run: pip install python-socks",
+            )
+            return
+
         if self.config.get("ip_safety", False):
-            if not self.config.get("proxy_enabled", False):
+            if mode == "udp":
+                messagebox.showerror(
+                    "IP Safety",
+                    "BZCC RakNet monitoring uses raw UDP, which cannot go through "
+                    "a proxy.\nConnection blocked. Disable IP Safety or use an "
+                    "http:// lobby URL instead.",
+                )
+                return
+            if not proxy_on:
                 messagebox.showerror(
                     "IP Safety",
                     "IP Safety is enabled but Proxy is disabled.\nConnection blocked.",
                 )
                 return
-
-            p_host = self.config.get("proxy_host", "")
-            p_port = self.config.get("proxy_port", "")
             if not p_host or not p_port:
                 messagebox.showerror(
                     "IP Safety", "Proxy configuration missing.\nConnection blocked."
                 )
                 return
 
+            # Verify the proxy off the UI thread, then continue on it.
+            self.should_run = True
+            self.conn_gen += 1
+            gen = self.conn_gen
+            self.connect_btn.config(text="Cancel")
+            self.status_var.set("Verifying proxy...")
             self.log("IP Safety: Verifying proxy...")
-            self.root.update()
-            if not self._test_proxy_connection(p_host, p_port):
-                self._set_proxy_indicator(False)
-                messagebox.showerror(
-                    "IP Safety", "Proxy connection failed.\nConnection blocked."
-                )
-                self.log("IP Safety: Proxy check failed.")
-                return
-            self._set_proxy_indicator(True)
-            self.log("IP Safety: Proxy verified.")
+
+            def verify():
+                ok = self._test_proxy_connection(p_host, p_port)
+                self.call_in_ui(self._after_proxy_check, gen, ok, mode, host)
+
+            threading.Thread(target=verify, daemon=True).start()
+            return
 
         self.should_run = True
-        self.connect_btn.config(text="Disconnect")
+        self.conn_gen += 1
+        self._start_connection(mode, host, self.conn_gen)
 
-        game = self.game_var.get()
-        if game == "Battlezone 98 Redux":
+    def _after_proxy_check(self, gen, ok, mode, host):
+        if not self._conn_active(gen):
+            return  # user cancelled while we were checking
+        self._set_proxy_indicator(ok)
+        if not ok:
+            self.log("IP Safety: Proxy check failed.")
+            self._set_disconnected_ui()
+            self.should_run = False
+            messagebox.showerror("IP Safety", "Proxy connection failed.\nConnection blocked.")
+            return
+        self.log("IP Safety: Proxy verified.")
+        self._start_connection(mode, host, gen)
+
+    def _start_connection(self, mode, host, gen):
+        self.connect_btn.config(text="Disconnect")
+        if mode == "ws":
             url = f"ws://{host}"
             self.log(f"Connecting to {url}...")
             self.status_var.set("Connecting...")
-            self.ws_thread = threading.Thread(target=self.run_ws, args=(url,))
-        elif host.startswith("http"):
+            target = self.run_ws
+            arg = url
+        elif mode == "http":
             self.log(f"Starting BZCC HTTP Monitor on {host}...")
             self.status_var.set("Monitoring (HTTP)...")
-            self.ws_thread = threading.Thread(target=self.run_bzcc_http, args=(host,))
+            target = self.run_bzcc_http
+            arg = host
         else:
             self.log(f"Starting RakNet Monitor on {host}...")
             self.status_var.set("Monitoring (UDP)...")
-            self.ws_thread = threading.Thread(target=self.run_raknet, args=(host,))
+            target = self.run_raknet
+            arg = host
 
-        self.ws_thread.daemon = True
+        self.ws_thread = threading.Thread(target=target, args=(arg, gen), daemon=True)
         self.ws_thread.start()
 
     def disconnect(self):
+        self._cancel_reconnect()
         self.should_run = False
-        if self.ws:
-            self.ws.close()
+        self.conn_gen += 1  # retire the current worker
+        ws = self.ws
+        self.ws = None
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
         self.connected = False
+        self._set_disconnected_ui()
+        self.log("Disconnected.")
+
+    def _set_disconnected_ui(self):
         self.connect_btn.config(text="Connect")
         self.status_var.set("Disconnected")
-        self.log("Disconnected.")
+
+    def _cancel_reconnect(self):
+        if self.reconnect_after_id is not None:
+            try:
+                self.root.after_cancel(self.reconnect_after_id)
+            except Exception:
+                pass
+            self.reconnect_after_id = None
+
+    def _on_worker_stopped(self, gen, source):
+        """Called on the UI thread when a connection worker exits."""
+        if gen != self.conn_gen:
+            return  # an old worker; a newer connection (or disconnect) owns the UI
+        self.connected = False
+        self.ws = None
+        self.log(f"{source} stopped.")
+        if not self.should_run:
+            self._set_disconnected_ui()
+            return
+
+        self.trigger_alert("disconnect")
+        if self.config.get("auto_reconnect", False):
+            delay = max(1, int(self.config.get("reconnect_delay", 10) or 10))
+            self.log(f"Auto-reconnecting in {delay}s...")
+            self.status_var.set(f"Reconnecting in {delay}s...")
+            self.connect_btn.config(text="Stop")
+            self._cancel_reconnect()
+            self.reconnect_after_id = self.root.after(delay * 1000, self._auto_reconnect)
+        else:
+            self.should_run = False
+            self._set_disconnected_ui()
+
+    def _auto_reconnect(self):
+        self.reconnect_after_id = None
+        if self.should_run and not self.connected:
+            self.connect()
 
     def open_raknet_debugger(self):
         win = tk.Toplevel(self.root)
@@ -2242,7 +2323,7 @@ class BZLobbyMonitor:
                 self.tx_rel_seq = (self.tx_rel_seq + 1) & 0xFFFFFF
                 self.raknet_query = self.patch_raknet_packet(raw, self.tx_rel_seq)
                 log_area.insert("end", f"Query Set (RelSeq: {self.tx_rel_seq})\n")
-            except:
+            except Exception:
                 log_area.insert("end", "Invalid Hex\n")
 
         def load_connect():
@@ -2296,40 +2377,7 @@ class BZLobbyMonitor:
             "isPrivate": False,
             "owner": "Unknown",
         }
-        self.root.after(0, self.refresh_tree)
-
-    def parse_raknet_frames(self, data):
-        try:
-            frames = []
-            offset = 4  # Skip ID(1) + Seq(3)
-            while offset < len(data):
-                flags = data[offset]
-                offset += 1
-                reliability = (flags >> 5) & 0x07
-                is_split = (flags & 0x10) != 0
-
-                if offset + 2 > len(data):
-                    break
-                length_bits = (data[offset] << 8) | data[offset + 1]
-                offset += 2
-                length_bytes = (length_bits + 7) // 8
-
-                if reliability in [2, 3, 4]:
-                    offset += 3  # Reliable Message Number
-                if reliability in [1, 4]:
-                    offset += 4  # Sequencing Index (3) + Order Channel (1)
-                if reliability == 3:
-                    offset += 4  # Ordering Index (3) + Order Channel (1)
-                if is_split:
-                    offset += 10
-
-                if offset + length_bytes > len(data):
-                    break
-                frames.append(data[offset : offset + length_bytes])
-                offset += length_bytes
-            return frames
-        except:
-            return []
+        self.refresh_tree()
 
     def patch_raknet_packet(self, pkt, new_rel_seq=None):
         if len(pkt) < 10:
@@ -2341,21 +2389,11 @@ class BZLobbyMonitor:
         is_split = (flags & 0x10) != 0
 
         header_len = 7  # ID(1)+Seq(3)+Flags(1)+Len(2)
-        has_rel_seq = reliability in [2, 3, 4]
-
-        if has_rel_seq:
-            if new_rel_seq is not None:
-                # Patch Reliable Sequence Number (Bytes 7,8,9)
-                rel_bytes = new_rel_seq.to_bytes(3, "little")
-                pkt = pkt[:7] + rel_bytes + pkt[10:]
-            header_len += 3
-
-        if reliability in [1, 4]:
-            header_len += 4
-        if reliability == 3:
-            header_len += 4
-        if is_split:
-            header_len += 10
+        if reliability in (2, 3, 4, 6, 7) and new_rel_seq is not None:
+            # Patch Reliable Message Number (Bytes 7,8,9)
+            rel_bytes = new_rel_seq.to_bytes(3, "little")
+            pkt = pkt[:7] + rel_bytes + pkt[10:]
+        header_len += raknet_frame_header_extra(reliability, is_split)
 
         if len(pkt) <= header_len:
             return pkt
@@ -2386,15 +2424,15 @@ class BZLobbyMonitor:
 
         return pkt
 
-    def run_raknet(self, host_str):
-        host, port = host_str.split(":") if ":" in host_str else (host_str, 61111)
+    def run_raknet(self, host_str, gen):
+        host, _, port = host_str.rpartition(":") if ":" in host_str else (host_str, "", "61111")
         try:
             port = int(port)
         except ValueError:
             port = 61111
 
         self.connected = True
-        self.root.after(0, lambda: self.status_var.set("Monitoring (UDP)"))
+        self.call_in_ui(lambda: self.status_var.set("Monitoring (UDP)"))
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(2.0)
@@ -2428,7 +2466,6 @@ class BZLobbyMonitor:
         self.tx_rel_seq = -1
         self._connect_sent = False
         self._connect_rel_seq = 0
-        query_log_counter = 0
         send_now = (
             False  # set True on rx to trigger immediate send without waiting 1s tick
         )
@@ -2448,10 +2485,10 @@ class BZLobbyMonitor:
             ip_bytes = socket.inet_aton(socket.gethostbyname(host))
             port_bytes = port.to_bytes(2, "big")
             self.server_addr_bytes = b"\x04" + ip_bytes + port_bytes
-        except:
+        except Exception:
             self.server_addr_bytes = b"\x04\x7f\x00\x00\x01" + port.to_bytes(2, "big")
 
-        while self.should_run:
+        while self._conn_active(gen):
             try:
                 # Send when: 1-second retry tick fires, OR send_now was set by a received packet
                 if send_now or (time.time() - last_send_time > 1.0):
@@ -2498,9 +2535,7 @@ class BZLobbyMonitor:
                             "Sending Query (0x60) — polling HTTP for lobby data..."
                         )
                         pkt_mode = 7
-                        threading.Thread(
-                            target=self.poll_http_lobby, daemon=True
-                        ).start()
+                        self.start_http_lobby_poll()
                         last_http_poll = time.time()
 
                     elif (
@@ -2545,7 +2580,7 @@ class BZLobbyMonitor:
                                 pkt_mode = 2
                                 send_now = True
                                 self.log("Pong received — sending OCR1 immediately.")
-                            self.register_direct_lobby(addr, "Ping OK")
+                            self.call_in_ui(self.register_direct_lobby, addr, "Ping OK")
 
                         elif pid == 0x06:  # Open Connection Reply 1
                             if len(data) >= 28:
@@ -2556,13 +2591,13 @@ class BZLobbyMonitor:
                             if pkt_mode < 3:
                                 pkt_mode = 3
                                 send_now = True
-                            self.register_direct_lobby(addr, "Handshake (1/2)")
+                            self.call_in_ui(self.register_direct_lobby, addr, "Handshake (1/2)")
 
                         elif pid == 0x08:  # Open Connection Reply 2
                             self.log(
                                 f"RX Open Connection Reply 2 from {addr}. Connection Established!"
                             )
-                            self.register_direct_lobby(addr, "Connected")
+                            self.call_in_ui(self.register_direct_lobby, addr, "Connected")
                             if pkt_mode < 4:
                                 pkt_mode = 4
                                 send_now = True
@@ -2578,7 +2613,7 @@ class BZLobbyMonitor:
                             ack_pkt = b"\xc0\x00\x01\x01" + seq_bytes
                             sock.sendto(ack_pkt, (host, port))
 
-                            frames = self.parse_raknet_frames(data)
+                            frames = parse_raknet_frames(data)
                             is_ping_pong = all(
                                 f and f[0] in [0x00, 0x03] for f in frames
                             )
@@ -2604,9 +2639,7 @@ class BZLobbyMonitor:
                                         count = int.from_bytes(payload[:4], "little")
                                         self.log(f"  -> Lobby Count: {count}")
                                         if count > 0:
-                                            threading.Thread(
-                                                target=self.poll_http_lobby, daemon=True
-                                            ).start()
+                                            self.start_http_lobby_poll()
                                             last_http_poll = time.time()
 
                         else:
@@ -2624,102 +2657,42 @@ class BZLobbyMonitor:
                 break
 
         sock.close()
-        self.connected = False
-        self.root.after(0, lambda: self.status_var.set("Disconnected"))
-        self.root.after(0, lambda: self.connect_btn.config(text="Connect"))
-        self.log("RakNet Monitor Stopped.")
+        self.call_in_ui(self._on_worker_stopped, gen, "RakNet Monitor")
 
-        if self.should_run and self.config.get("auto_reconnect", False):
-            delay = self.config.get("reconnect_delay", 10)
-            self.log(f"Auto-reconnecting in {delay}s...")
-            self.root.after(delay * 1000, self.connect)
-
-    def run_bzcc_http(self, url):
+    def run_bzcc_http(self, url, gen):
         self.connected = True
 
-        while self.should_run:
+        while self._conn_active(gen):
             try:
                 req = urllib.request.Request(
                     url, headers={"User-Agent": "BZLobbyMonitor/1.0"}
                 )
-                with urllib.request.urlopen(req, timeout=10) as r:
+                with self.open_url(req) as r:
                     data = json.loads(r.read().decode("utf-8"))
-                    self.process_bzcc_data(data)
+                if self._conn_active(gen):
+                    self.call_in_ui(self.process_bzcc_data, data)
             except Exception as e:
                 self.log(f"HTTP Error: {e}")
 
             for _ in range(15):  # Poll every 15s
-                if not self.should_run:
+                if not self._conn_active(gen):
                     break
                 time.sleep(1)
 
-        self.connected = False
-        self.root.after(0, lambda: self.status_var.set("Disconnected"))
-        self.root.after(0, lambda: self.connect_btn.config(text="Connect"))
-        self.log("BZCC Monitor Stopped.")
+        self.call_in_ui(self._on_worker_stopped, gen, "BZCC Monitor")
 
     def process_bzcc_data(self, data):
-        # Map BZCC JSON (Model.cs) to internal lobby structure
-        games = data.get("GET", [])
+        """Merge a BZCC lobby-server snapshot. Must run on the UI thread."""
+        games = data.get("GET", []) if isinstance(data, dict) else []
         new_lobbies = {}
 
-        for g in games:
-            lid = g.get("g")  # GUID
-            if not lid:
+        for g in games or []:
+            if not isinstance(g, dict):
                 continue
-
-            # Decode Name (Base64)
-            raw_name = g.get("n") or ""
-            try:
-                raw_name += "=" * ((4 - len(raw_name) % 4) % 4)
-                decoded = base64.b64decode(raw_name)
-                name_bytes = decoded.split(b"\x00")[0]
-                name = name_bytes.decode("utf-8", errors="replace")
-            except:
-                name = raw_name
-
-            map_name = g.get("m", "Unknown")
-
-            users = {}
-            players = g.get("pl") or []
-            for p in players:
-                pid = p.get("i", "Unknown")
-                p_raw = p.get("n") or ""
-                try:
-                    p_raw += "=" * ((4 - len(p_raw) % 4) % 4)
-                    p_decoded = base64.b64decode(p_raw)
-                    p_name = p_decoded.split(b"\x00")[0].decode(
-                        "utf-8", errors="replace"
-                    )
-                except:
-                    p_name = p_raw
-                users[str(pid)] = {
-                    "name": p_name,
-                    "id": pid,
-                    "team": p.get("t"),
-                    "score": p.get("s"),
-                }
-
-            lobby = {
-                "id": lid,
-                "metadata": {
-                    "name": name,
-                    "gameType": "BZCC",
-                    "map": map_name,
-                    "gameSettings": f"*{map_name}*",
-                    "ready": f"*{map_name}*",
-                    "version": g.get("v", "?"),
-                    "typeId": g.get("gt", 0),
-                    "stateId": g.get("si", 0),
-                    "maxPlayers": g.get("pm", 0),
-                },
-                "users": users,
-                "memberLimit": g.get("pm", 0),
-                "isLocked": str(g.get("l")) == "1",
-                "isPrivate": str(g.get("k")) == "1",
-                "owner": users[str(next(iter(users)))]["id"] if users else "Unknown",
-            }
-            new_lobbies[str(lid)] = lobby
+            built = build_bzcc_lobby(g)
+            if built:
+                lid, lobby = built
+                new_lobbies[lid] = lobby
 
         # Diff against previous state to synthesize join/leave/new-game/gone-game events
         old_lobby_ids = set(k for k in self.lobbies if not k.startswith("direct_"))
@@ -2757,35 +2730,62 @@ class BZLobbyMonitor:
             k: v for k, v in self.lobbies.items() if k.startswith("direct_")
         }
         self.lobbies = {**direct_lobbies, **new_lobbies}
-        self.root.after(0, self.refresh_tree)
+        self.refresh_tree()
 
-    def run_ws(self, url):
+    def run_ws(self, url, gen):
         # websocket.enableTrace(True)
 
         proxy_opts = {}
         if self.config.get("proxy_enabled", False):
-            host = self.config.get("proxy_host", "").strip()
-            port = self.config.get("proxy_port", "").strip()
+            host = str(self.config.get("proxy_host", "")).strip()
+            port = str(self.config.get("proxy_port", "")).strip()
             ptype = self.config.get("proxy_type", "http")
+            if ptype == "socks5":
+                # socks5h resolves hostnames through the proxy (no DNS leak).
+                ptype = "socks5h"
             if host and port:
-                proxy_opts["http_proxy_host"] = host
-                proxy_opts["http_proxy_port"] = port
-                proxy_opts["proxy_type"] = ptype
-                self.log(f"Using Proxy: {host}:{port} ({ptype})")
+                try:
+                    proxy_opts["http_proxy_host"] = host
+                    proxy_opts["http_proxy_port"] = int(port)
+                    proxy_opts["proxy_type"] = ptype
+                    self.log(f"Using Proxy: {host}:{port} ({ptype})")
+                except ValueError:
+                    self.log(f"Invalid proxy port: {port}")
+                    self.call_in_ui(self._on_worker_stopped, gen, "WebSocket")
+                    return
 
-        self.ws = websocket.WebSocketApp(
+        # Callbacks run on this worker thread; hand everything to the UI thread
+        # and tag it with the connection generation so stale sockets are ignored.
+        ws_app = websocket.WebSocketApp(
             url,
-            on_open=self.on_open,
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close,
+            on_open=lambda ws: self.call_in_ui(self._on_open_ui, ws, gen),
+            on_message=lambda ws, msg: self.call_in_ui(self._on_message_ui, ws, msg, gen),
+            on_error=lambda ws, err: self.log(f"WebSocket Error: {err}"),
         )
+        self.ws = ws_app
+        try:
+            ws_app.run_forever(**proxy_opts)
+        except Exception as e:
+            self.log(f"WebSocket Error: {e}")
+        self.call_in_ui(self._on_worker_stopped, gen, "WebSocket")
 
-        self.ws.run_forever(**proxy_opts)
+    def _on_open_ui(self, ws, gen):
+        if gen != self.conn_gen:
+            try:
+                ws.close()
+            except Exception:
+                pass
+            return
+        self.ws = ws
+        self.on_open(ws)
+
+    def _on_message_ui(self, ws, message, gen):
+        if gen == self.conn_gen:
+            self.on_message(ws, message)
 
     def on_open(self, ws):
         self.connected = True
-        self.root.after(0, lambda: self.status_var.set("Connected"))
+        self.status_var.set("Connected")
         self.log("WebSocket Connected.")
 
         # Send Auth
@@ -2862,22 +2862,6 @@ class BZLobbyMonitor:
         except Exception as e:
             self.log(f"Error parsing message: {e}")
 
-    def on_error(self, ws, error):
-        self.log(f"WebSocket Error: {error}")
-
-    def on_close(self, ws, close_status_code, close_msg):
-        self.connected = False
-        self.root.after(0, lambda: self.status_var.set("Disconnected"))
-        self.root.after(0, lambda: self.connect_btn.config(text="Connect"))
-        self.log("WebSocket Closed.")
-        if self.should_run:
-            self.trigger_alert("disconnect")
-
-            if self.config.get("auto_reconnect", False):
-                delay = self.config.get("reconnect_delay", 10)
-                self.log(f"Auto-reconnecting in {delay}s...")
-                self.root.after(delay * 1000, self.connect)
-
     def set_player_data(self):
         name = self.name_var.get()
 
@@ -2905,10 +2889,12 @@ class BZLobbyMonitor:
             new_lobbies = data.get("lobbies", {})
         else:
             new_lobbies = data
-        self.lobbies = new_lobbies
+        if not isinstance(new_lobbies, dict):
+            new_lobbies = {}
+        self.lobbies = {str(k): v for k, v in new_lobbies.items() if isinstance(v, dict)}
         self.log(f"Received Full Lobby List: {len(self.lobbies)} lobbies.")
-        self.root.after(0, self.refresh_tree)
-        self.root.after(0, self.check_and_update_current_lobby)
+        self.call_in_ui(self.refresh_tree)
+        self.call_in_ui(self.check_and_update_current_lobby)
         self.root.after(2000, self.check_auto_claim)
 
     def handle_lobby_changed(self, data):
@@ -2922,6 +2908,8 @@ class BZLobbyMonitor:
             changed_lobbies = {}
 
         for lid, lobby in changed_lobbies.items():
+            if not isinstance(lobby, dict):
+                continue
             if self.config.get("alert_griefer", False):
                 self.check_griefer_join(str(lid), lobby)
 
@@ -2937,32 +2925,34 @@ class BZLobbyMonitor:
             if users_changed:
                 self.check_auto_ban_lobby(str(lid))
         self.log(f"Lobbies Updated: {list(changed_lobbies.keys())}")
-        self.root.after(0, self.refresh_tree)
-        self.root.after(0, self.check_and_update_current_lobby)
+        self.call_in_ui(self.refresh_tree)
+        self.call_in_ui(self.check_and_update_current_lobby)
+
+    def get_griefer_ids(self):
+        return set(parse_id_list(self.config.get("griefer_ids", "")))
+
+    def is_known_griefer(self, uid):
+        uid = str(uid).lower()
+        ids = self.get_griefer_ids()
+        # Accept Steam IDs with or without the "S" prefix.
+        return uid in ids or f"s{uid}" in ids or (uid.startswith("s") and uid[1:] in ids)
 
     def check_griefer_join(self, lid, new_lobby_data):
-        griefer_id = "S76561198297657246"
-        new_users = new_lobby_data.get("users", {})
+        new_users = new_lobby_data.get("users", {}) or {}
+        old_users = (self.lobbies.get(lid) or {}).get("users", {}) or {}
 
-        if griefer_id in new_users:
-            # Check if already present in old data
-            old_lobby = self.lobbies.get(lid)
-            is_new = True
-            if old_lobby:
-                old_users = old_lobby.get("users", {})
-                if griefer_id in old_users:
-                    is_new = False
-
-            if is_new:
-                name = new_users[griefer_id].get("name", "Unknown")
-                self.log(f"WARNING: Griefer {name} detected in lobby {lid}")
-                self.trigger_alert("griefer_join", name)
+        for uid, user in new_users.items():
+            if not self.is_known_griefer(uid) or uid in old_users:
+                continue
+            name = user.get("name", "Unknown") if isinstance(user, dict) else "Unknown"
+            self.log(f"WARNING: Griefer {name} detected in lobby {lid}")
+            self.trigger_alert("griefer_join", name)
 
     def handle_lobby_removed(self, data):
         lid = str(data.get("id"))
         if lid in self.lobbies:
             del self.lobbies[lid]
-            self.root.after(0, self.refresh_tree)
+            self.call_in_ui(self.refresh_tree)
             self.log(f"Lobby Removed: {lid}")
             self.root.after(2000, self.check_auto_claim)
         if self.current_lobby_id is not None and str(self.current_lobby_id) == str(lid):
@@ -2996,9 +2986,13 @@ class BZLobbyMonitor:
         if speaker_id and str(speaker_id) in self.muted_users:
             return
 
-        text = chat.get("text", "")
+        text = str(chat.get("text", ""))
         self.log(f"[CHAT] {author}: {text}")
         self.log_chat(author, text)
+
+        # Don't bounce messages we relayed from Discord back to Discord.
+        if text.startswith("[Discord] "):
+            return
 
         # Relay to Discord
         if self.config.get("discord_enabled", False) and self.config.get(
@@ -3012,6 +3006,7 @@ class BZLobbyMonitor:
         member = data.get("member")
         lid = data.get("lobbyId")
         uid = data.get("id", member)
+        member = "" if member is None else str(member)
         action = "left" if data.get("removed") else "joined"
         self.log(f"User {member} {action} lobby {lid}")
         if not data.get("removed"):
@@ -3048,7 +3043,7 @@ class BZLobbyMonitor:
         ban_list = self.config.get("ban_list", "").lower().splitlines()
         ban_list = [b.strip() for b in ban_list if b.strip()]
 
-        if str(uid).lower() in ban_list or name.lower() in ban_list:
+        if str(uid).lower() in ban_list or str(name or "").lower() in ban_list:
             self._auto_kick(uid, name, "Auto-Ban (ID/Name Match)")
 
     def check_auto_ban_lobby(self, lid):
@@ -3071,8 +3066,10 @@ class BZLobbyMonitor:
             if str(uid) == str(self.my_id):
                 continue
 
-            name = u_data.get("name", "").lower()
-            ip = u_data.get("ipAddress", "").lower()
+            if not isinstance(u_data, dict):
+                continue
+            name = str(u_data.get("name") or "").lower()
+            ip = str(u_data.get("ipAddress") or "").lower()
 
             if (
                 str(uid).lower() in ban_list
@@ -3084,6 +3081,8 @@ class BZLobbyMonitor:
                 )
 
     def _auto_kick(self, uid, name, reason):
+        if not (self.ws and self.connected):
+            return
         self.log(f"!!! KICKING {name} (ID: {uid}) - Reason: {reason} !!!")
         self.ws.send(
             json.dumps(
@@ -3122,11 +3121,19 @@ class BZLobbyMonitor:
             return
 
         found_lobby_id = None
+        my_id = str(self.my_id)
         for lid, lobby in self.lobbies.items():
-            if self.my_id in lobby.get("users", {}):
-                found_lobby_id = int(lid)
+            users = lobby.get("users", {}) if isinstance(lobby, dict) else {}
+            if isinstance(users, dict) and my_id in {str(u) for u in users}:
+                found_lobby_id = lid
                 break
         self.update_current_lobby(found_lobby_id)
+
+    @staticmethod
+    def _server_lobby_id(lobby_id):
+        """The lobby server uses numeric ids for BZ98R lobbies."""
+        text = str(lobby_id)
+        return int(text) if text.isdigit() else lobby_id
 
     def update_current_lobby(self, lobby_id):
         self.current_lobby_id = lobby_id
@@ -3136,14 +3143,14 @@ class BZLobbyMonitor:
                 .get("metadata", {})
                 .get("name", f"ID: {lobby_id}")
             )
-            self.root.after(
-                0, lambda: self.current_lobby_var.set(f"In Lobby: {lobby_name}")
+            self.call_in_ui(
+                lambda: self.current_lobby_var.set(f"In Lobby: {lobby_name}")
             )
-            self.root.after(0, lambda: self.leave_btn.config(text="Leave Lobby"))
+            self.call_in_ui(lambda: self.leave_btn.config(text="Leave Lobby"))
             self.update_rpc(f"In Lobby: {lobby_name}", "Playing Battlezone 98 Redux")
         else:
-            self.root.after(0, lambda: self.current_lobby_var.set("In Lounge"))
-            self.root.after(0, lambda: self.leave_btn.config(text="Refresh Lounge"))
+            self.call_in_ui(lambda: self.current_lobby_var.set("In Lounge"))
+            self.call_in_ui(lambda: self.leave_btn.config(text="Refresh Lounge"))
             self.update_rpc("In Lounge", "Browsing Lobbies")
 
     def refresh_tree(self):
@@ -3154,22 +3161,21 @@ class BZLobbyMonitor:
             selected_id = self.tree.item(selected_items[0])["values"][0]
 
         # Clear
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        for row_id in self.tree.get_children():
+            self.tree.delete(row_id)
 
         # Repopulate
-        friends = self.config.get("friend_list", "").lower().splitlines()
+        friends = parse_id_list(self.config.get("friend_list", ""))
         for lid, lobby in self.lobbies.items():
             if str(lid).startswith("direct_"):
                 continue
+            if not isinstance(lobby, dict):
+                continue
             meta = lobby.get("metadata", {})
-            raw_name = meta.get("name", "Unknown")
-
+            if not isinstance(meta, dict):
+                meta = {}
             # Clean up name display (remove ~chat~pub~~ prefix)
-            if "~~" in raw_name:
-                name = raw_name.split("~~")[-1]
-            else:
-                name = raw_name
+            name = clean_lobby_name(meta.get("name"), default="Unknown")
 
             owner = lobby.get("owner", "Unknown")
             if owner == -1:
@@ -3177,22 +3183,23 @@ class BZLobbyMonitor:
 
             # Calculate player count
             users = lobby.get("users", {})
+            if not isinstance(users, dict):
+                users = {}
 
             # Check for friends
-            has_friend = False
-            for uid, u_data in users.items():
-                u_name = u_data.get("name", "").lower()
-                if any(
-                    f.strip() in u_name or f.strip() in str(uid).lower()
-                    for f in friends
-                    if f.strip()
-                ):
-                    has_friend = True
-                    break
+            has_friend = any(
+                list_matches(friends, (u or {}).get("name") if isinstance(u, dict) else "", uid)
+                for uid, u in users.items()
+            )
 
             if self.filter_locked_var.get() and lobby.get("isLocked"):
                 continue
-            if self.filter_full_var.get() and len(users) >= lobby.get("memberLimit", 0):
+            try:
+                member_limit = int(lobby.get("memberLimit") or 0)
+            except (TypeError, ValueError):
+                member_limit = 0
+            # A zero/unknown limit means "unknown", not "full".
+            if self.filter_full_var.get() and member_limit > 0 and len(users) >= member_limit:
                 continue
 
             player_count = f"{len(users)}/{lobby.get('memberLimit', '?')}"
@@ -3224,9 +3231,9 @@ class BZLobbyMonitor:
 
         # Restore selection if possible
         if selected_id:
-            for item in self.tree.get_children():
-                if str(self.tree.item(item)["values"][0]) == str(selected_id):
-                    self.tree.selection_set(item)
+            for row_id in self.tree.get_children():
+                if str(self.tree.item(row_id)["values"][0]) == str(selected_id):
+                    self.tree.selection_set(row_id)
                     break
         self.refresh_waiting_room()
 
@@ -3314,9 +3321,10 @@ class BZLobbyMonitor:
         game_settings = l_meta.get("gameSettings")
         mod_id = None
         if game_settings:
-            parts = game_settings.split("*")
-            if len(parts) > 3 and parts[3] not in ["0", ""]:
-                mod_id = parts[3]
+            parts = str(game_settings).split("*")
+            # Workshop ids are numeric; anything else would end up in a URL.
+            if len(parts) > 3 and parts[3].strip().isdigit() and parts[3].strip() != "0":
+                mod_id = parts[3].strip()
 
         if mod_id and mod_id in self.image_cache:
             self.preview_label.config(image=self.image_cache[mod_id], text="")
@@ -3400,7 +3408,7 @@ class BZLobbyMonitor:
             self.lobby_details_text.insert("end", f"Game Settings: {game_settings}\n")
 
         if str(l_meta.get("launched")) == "1":
-            self.lobby_details_text.insert("end", f"Status: Launched\n")
+            self.lobby_details_text.insert("end", "Status: Launched\n")
 
         self.lobby_details_text.config(state="disabled")
 
@@ -3411,7 +3419,7 @@ class BZLobbyMonitor:
         self.player_details_text.delete("1.0", "end")
 
         users = lobby.get("users", {})
-        friends = self.config.get("friend_list", "").lower().splitlines()
+        friends = parse_id_list(self.config.get("friend_list", ""))
         owner_id = str(lobby.get("owner", ""))
         groups = {}
         if isinstance(users, dict):
@@ -3445,11 +3453,7 @@ class BZLobbyMonitor:
                 if not isinstance(user_meta, dict):
                     user_meta = {}
 
-                is_friend = any(
-                    f.strip() in user_name.lower() or f.strip() in str(uid).lower()
-                    for f in friends
-                    if f.strip()
-                )
+                is_friend = list_matches(friends, user_name, uid)
 
                 self.player_details_text.insert(
                     "end", f" - {user_name} (ID: {uid})", "friend" if is_friend else ""
@@ -3469,7 +3473,7 @@ class BZLobbyMonitor:
                     if geo:
                         self.player_details_text.insert("end", f"   Loc: {geo}\n")
 
-                if uid.startswith("S"):
+                if uid.startswith("S") and uid[1:].isdigit():
                     steam_id = uid[1:]
 
                     if HAS_PIL:
@@ -3489,7 +3493,7 @@ class BZLobbyMonitor:
                         f"https://steamcommunity.com/profiles/{steam_id}",
                     )
 
-                    if steam_id == "76561198297657246":
+                    if self.is_known_griefer(uid):
                         self.player_details_text.insert(
                             "end", " [KNOWN GRIEFER]", "griefer"
                         )
@@ -3516,7 +3520,7 @@ class BZLobbyMonitor:
                                 "end", f"   Ready Map: {ready_map}\n"
                             )
                     if user_meta.get("launched") == "1":
-                        self.player_details_text.insert("end", f"   Status: Launched\n")
+                        self.player_details_text.insert("end", "   Status: Launched\n")
 
                 # Network Info
                 wan = user.get("wanAddress")
@@ -3540,6 +3544,9 @@ class BZLobbyMonitor:
         self.player_details_text.yview_moveto(scroll_pos[0])
 
     def fetch_image(self, target_id, is_mod):
+        # Don't retry a failed fetch on every redraw.
+        if time.time() - self.image_failed.get(target_id, 0) < 600:
+            return
         self.pending_fetches.add(target_id)
         threading.Thread(
             target=self._fetch_image_worker, args=(target_id, is_mod), daemon=True
@@ -3551,8 +3558,8 @@ class BZLobbyMonitor:
             if is_mod:
                 url = f"https://steamcommunity.com/sharedfiles/filedetails/?id={target_id}"
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req) as r:
-                    html = r.read().decode("utf-8")
+                with self.open_url(req) as r:
+                    html = r.read(2_000_000).decode("utf-8", errors="replace")
                     # Try to find preview image
                     thumb = re.search(r'id="ActualImage"\s+src="([^"]+)"', html)
                     if not thumb:
@@ -3565,8 +3572,8 @@ class BZLobbyMonitor:
                 # Fetch Steam Profile XML
                 url = f"https://steamcommunity.com/profiles/{target_id}?xml=1"
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req) as r:
-                    xml = r.read().decode("utf-8")
+                with self.open_url(req) as r:
+                    xml = r.read(2_000_000).decode("utf-8", errors="replace")
                     # Simple regex for avatarMedium
                     avatar = re.search(
                         r"<avatarMedium><!\[CDATA\[(.*?)\]\]></avatarMedium>", xml
@@ -3574,28 +3581,27 @@ class BZLobbyMonitor:
                     if avatar:
                         image_url = avatar.group(1)
 
-            if image_url:
-                with urllib.request.urlopen(image_url) as r:
-                    data = r.read()
-                    self.root.after(
-                        0, lambda: self._cache_image(target_id, data, is_mod)
-                    )
+            # Only follow https image links scraped from the page.
+            if image_url and image_url.startswith("https://"):
+                with self.open_url(image_url) as r:
+                    data = r.read(5_000_000)
+                self.call_in_ui(self._cache_image, target_id, data, is_mod)
             else:
+                self.image_failed[target_id] = time.time()
                 self.pending_fetches.discard(target_id)
 
         except Exception as e:
             print(f"Image fetch failed for {target_id}: {e}")
+            self.image_failed[target_id] = time.time()
             self.pending_fetches.discard(target_id)
 
     def _cache_image(self, target_id, data, is_mod):
         try:
             img = Image.open(BytesIO(data))
-            img.thumbnail((50, 50), Image.Resampling.LANCZOS)
+            # Larger preview for the lobby panel, avatar-sized otherwise.
+            size = (280, 160) if is_mod else (50, 50)
+            img.thumbnail(size, Image.Resampling.LANCZOS)
             self.image_cache[target_id] = ImageTk.PhotoImage(img)
-            if is_mod:  # Larger preview for lobby
-                img_large = Image.open(BytesIO(data))
-                img_large.thumbnail((280, 160), Image.Resampling.LANCZOS)
-                self.image_cache[target_id] = ImageTk.PhotoImage(img_large)
             # Refresh current view if applicable
             self.on_lobby_select(None)
         except Exception as e:
@@ -3605,13 +3611,17 @@ class BZLobbyMonitor:
 
     # --- Proxy Tools ---
     def set_tor_proxy(self):
-        # Check for pysocks
+        # pysocks is used for proxy tests and web lookups, python-socks by the
+        # WebSocket library itself.
         try:
-            import socks
+            import socks  # noqa: F401
         except ImportError:
+            socks = None
+        if socks is None or not HAS_PYTHON_SOCKS:
             messagebox.showerror(
                 "Missing Dependency",
-                "To use Tor (SOCKS5), you must install 'pysocks'.\nRun: pip install pysocks",
+                "To use Tor (SOCKS5), install 'pysocks' and 'python-socks'.\n"
+                "Run: pip install pysocks python-socks",
             )
             return
 
@@ -3630,19 +3640,28 @@ class BZLobbyMonitor:
             )
 
     def manage_tor_windows(self):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        bin_dir = os.path.join(base_dir, "bin", "tor")
+        bin_dir = os.path.join(APP_DIR, "bin", "tor")
         tor_exe = os.path.join(bin_dir, "tor.exe")
 
-        if not os.path.exists(tor_exe):
-            if messagebox.askyesno(
-                "Tor Not Found",
-                "Tor Expert Bundle is missing.\nDownload and configure it automatically?",
-            ):
-                self.download_tor(bin_dir)
-            else:
-                return
+        if os.path.exists(tor_exe):
+            self._finish_tor_setup(bin_dir)
+            return
 
+        if not messagebox.askyesno(
+            "Tor Not Found",
+            "Tor Expert Bundle is missing.\nDownload it from torproject.org and configure it automatically?",
+        ):
+            return
+
+        def worker():
+            ok = self.download_tor(bin_dir)
+            if ok:
+                self.call_in_ui(self._finish_tor_setup, bin_dir)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_tor_setup(self, bin_dir):
+        tor_exe = os.path.join(bin_dir, "tor.exe")
         if os.path.exists(tor_exe):
             self.start_tor(tor_exe, bin_dir)
 
@@ -3653,42 +3672,77 @@ class BZLobbyMonitor:
         self.save_ui_config()
         self.log("Tor Proxy Configured (127.0.0.1:9050)")
 
+    def _resolve_tor_bundle_url(self):
+        """Find the current Windows expert bundle link on the Tor download page."""
+        req = urllib.request.Request(TOR_DOWNLOAD_PAGE, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            html = r.read(2_000_000).decode("utf-8", errors="replace")
+        match = re.search(
+            r'href="(https://[^"]+/tor-expert-bundle-windows-x86_64-[0-9][0-9A-Za-z.\-]*\.tar\.gz)"',
+            html,
+        )
+        if not match:
+            raise RuntimeError("Could not find the Windows expert bundle on the Tor download page")
+        return match.group(1)
+
     def download_tor(self, target_dir):
+        """Download, verify and unpack Tor. Runs on a worker thread."""
         self.log("Downloading Tor Expert Bundle...")
-        # URL for Tor Expert Bundle Windows x86_64 (Stable) - uses dist.torproject.org stable redirect
-        url = "https://dist.torproject.org/torbrowser/tor-expert-bundle-windows-x86_64.tar.gz"
-        self.log(f"URL: {url}")
-
         try:
-            if not os.path.exists(target_dir):
-                os.makedirs(target_dir)
+            url = self._resolve_tor_bundle_url()
+            filename = url.rsplit("/", 1)[-1]
+            sums_url = url.rsplit("/", 1)[0] + "/sha256sums-signed-build.txt"
+            self.log(f"URL: {url}")
 
-            tar_path = os.path.join(target_dir, "tor.tar.gz")
-            urllib.request.urlretrieve(url, tar_path)
+            with urllib.request.urlopen(sums_url, timeout=20) as r:
+                sums = r.read(1_000_000).decode("utf-8", errors="replace")
+            expected = None
+            for line in sums.splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1].lstrip("*") == filename:
+                    expected = parts[0].lower()
+                    break
+            if not expected:
+                raise RuntimeError(f"No published SHA-256 for {filename}; refusing to install")
 
+            with urllib.request.urlopen(url, timeout=60) as r:
+                bundle = r.read(200_000_000)
+            actual = hashlib.sha256(bundle).hexdigest()
+            if actual != expected:
+                raise RuntimeError(f"SHA-256 mismatch for {filename}; refusing to install")
+
+            os.makedirs(target_dir, exist_ok=True)
             self.log("Extracting Tor...")
-            with tarfile.open(tar_path, "r:gz") as tar:
-                # Flatten structure: extract 'tor/tor.exe' directly to bin/tor/
+            with tarfile.open(fileobj=BytesIO(bundle), mode="r:gz") as tar:
+                # Flatten structure: write 'tor/tor.exe' and DLLs directly to bin/tor/.
+                # Only regular files, and only by basename, so nothing can escape.
                 for member in tar.getmembers():
-                    if "tor.exe" in member.name or "dll" in member.name:
-                        member.name = os.path.basename(member.name)  # Strip paths
-                        tar.extract(member, target_dir)
+                    base = os.path.basename(member.name)
+                    if not member.isfile():
+                        continue
+                    if base.lower() != "tor.exe" and not base.lower().endswith(".dll"):
+                        continue
+                    src = tar.extractfile(member)
+                    if src is None:
+                        continue
+                    with open(os.path.join(target_dir, base), "wb") as out:
+                        out.write(src.read())
 
-            os.remove(tar_path)
-
-            # Create default torrc
-            torrc_path = os.path.join(target_dir, "torrc")
-            data_dir = os.path.join(target_dir, "data")
-            if not os.path.exists(data_dir):
-                os.makedirs(data_dir)
-
-            with open(torrc_path, "w") as f:
-                f.write(f"SocksPort 9050\nDataDirectory {os.path.abspath(data_dir)}\n")
-
-            self.log("Tor installed successfully.")
+            self.log("Tor installed successfully (SHA-256 verified).")
+            return True
         except Exception as e:
             self.log(f"Tor Download Error: {e}")
-            messagebox.showerror("Error", f"Failed to download Tor:\n{e}")
+            self.call_in_ui(messagebox.showerror, "Error", f"Failed to download Tor:\n{e}")
+            return False
+
+    def _write_torrc(self, tor_dir):
+        # Always regenerate so DataDirectory points at this machine's folder.
+        data_dir = os.path.join(tor_dir, "data")
+        os.makedirs(data_dir, exist_ok=True)
+        torrc_path = os.path.join(tor_dir, "torrc")
+        with open(torrc_path, "w", encoding="utf-8") as f:
+            f.write(f'SocksPort 9050\nDataDirectory "{os.path.abspath(data_dir)}"\n')
+        return torrc_path
 
     def start_tor(self, exe_path, cwd):
         if self.tor_process:
@@ -3696,16 +3750,20 @@ class BZLobbyMonitor:
 
         self.log("Starting Tor process...")
         try:
-            # Hide console window
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            torrc_path = self._write_torrc(cwd)
+            kwargs = {}
+            if sys.platform == "win32":
+                # Hide console window
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                kwargs["startupinfo"] = startupinfo
 
             self.tor_process = subprocess.Popen(
-                [exe_path, "-f", "torrc"],
+                [exe_path, "-f", torrc_path],
                 cwd=cwd,
-                startupinfo=startupinfo,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                **kwargs,
             )
             self.log("Tor started in background.")
             self.tor_status_var.set("Tor: Running")
@@ -3722,6 +3780,14 @@ class BZLobbyMonitor:
             self.tor_status_label.config(fg="#666666")
 
     def find_free_proxy(self):
+        if not messagebox.askyesno(
+            "Public Proxy Warning",
+            "Free public proxies are run by unknown third parties.\n\n"
+            "The BZ98R lobby connection is unencrypted (ws://), so whoever runs the "
+            "proxy can read your chat and your lobby Key, and could tamper with traffic.\n\n"
+            "Continue?",
+        ):
+            return
         self.log("Searching for free proxies...")
         threading.Thread(target=self._find_proxy_worker, daemon=True).start()
 
@@ -3732,9 +3798,9 @@ class BZLobbyMonitor:
                 "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt"
             )
             req = urllib.request.Request(url)
-            with urllib.request.urlopen(req) as r:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
                 data = r.read().decode("utf-8")
-                proxies = [line.strip() for line in data.split("\n") if line.strip()]
+                proxies = [line.strip() for line in data.split("\n") if ":" in line]
 
             if not proxies:
                 self.log("No proxies found in list.")
@@ -3743,10 +3809,10 @@ class BZLobbyMonitor:
             # Test random proxies until one works
             random.shuffle(proxies)
             for proxy in proxies[:10]:  # Try up to 10
-                host, port = proxy.split(":")
+                host, _, port = proxy.rpartition(":")
                 self.log(f"Testing proxy {host}:{port}...")
                 if self._test_proxy_connection(host, port, ptype="http"):
-                    self.root.after(0, lambda h=host, p=port: self._set_proxy_ui(h, p))
+                    self.call_in_ui(lambda h=host, p=port: self._set_proxy_ui(h, p))
                     self.log(f"Found working proxy: {host}:{port}")
                     return
 
@@ -3769,16 +3835,16 @@ class BZLobbyMonitor:
                     s.connect(("www.google.com", 80))
                     s.close()
                     return True
-                except:
+                except Exception:
                     return False
             else:
                 proxy_handler = urllib.request.ProxyHandler(
-                    {"http": f"{host}:{port}", "https": f"{host}:{port}"}
+                    {"http": f"http://{host}:{port}", "https": f"http://{host}:{port}"}
                 )
                 opener = urllib.request.build_opener(proxy_handler)
                 opener.open("http://www.google.com", timeout=5)
                 return True
-        except:
+        except Exception:
             return False
 
     def test_proxy(self):
@@ -3789,7 +3855,7 @@ class BZLobbyMonitor:
             return
 
         def run_test():
-            self.root.after(0, lambda: self._set_proxy_indicator(None))
+            self.call_in_ui(lambda: self._set_proxy_indicator(None))
             success = False
             try:
                 if ptype == "socks5":
@@ -3812,8 +3878,7 @@ class BZLobbyMonitor:
                     body = response.split(b"\r\n\r\n")[1].decode("utf-8")
                     self.log(f"Proxy Test (SOCKS5): SUCCESS. IP: {body}")
                     success = True
-                    self.root.after(
-                        0,
+                    self.call_in_ui(
                         lambda: messagebox.showinfo(
                             "Proxy Verified",
                             f"SOCKS5 Proxy is working.\nExternal IP: {body}",
@@ -3826,8 +3891,7 @@ class BZLobbyMonitor:
                     with urllib.request.urlopen(req, timeout=10) as r:
                         ip = r.read().decode("utf-8")
                         self.log(f"Proxy Test (HTTP): SUCCESS. IP: {ip}")
-                        self.root.after(
-                            0,
+                        self.call_in_ui(
                             lambda: messagebox.showinfo(
                                 "Proxy Verified",
                                 f"HTTP Proxy is working.\nExternal IP: {ip}",
@@ -3838,9 +3902,9 @@ class BZLobbyMonitor:
                 self.log(f"Proxy Test Failed: {e}")
 
             if success:
-                self.root.after(0, lambda: self._set_proxy_indicator(True))
+                self.call_in_ui(lambda: self._set_proxy_indicator(True))
             else:
-                self.root.after(0, lambda: self._set_proxy_indicator(False))
+                self.call_in_ui(lambda: self._set_proxy_indicator(False))
 
         threading.Thread(target=run_test, daemon=True).start()
 
@@ -3856,29 +3920,29 @@ class BZLobbyMonitor:
         threading.Thread(target=self._proxy_monitor_loop, daemon=True).start()
 
     def _proxy_monitor_loop(self):
-        while self.should_run:
+        while self.app_running:
             if self.config.get("proxy_enabled", False):
                 host = self.config.get("proxy_host", "")
                 port = self.config.get("proxy_port", "")
                 if host and port:
                     res = self._test_proxy_connection(host, port)
-                    self.root.after(0, lambda r=res: self._set_proxy_indicator(r))
+                    self.call_in_ui(lambda r=res: self._set_proxy_indicator(r))
                 else:
-                    self.root.after(0, lambda: self._set_proxy_indicator(None))
+                    self.call_in_ui(lambda: self._set_proxy_indicator(None))
             else:
-                self.root.after(0, lambda: self._set_proxy_indicator(None))
+                self.call_in_ui(lambda: self._set_proxy_indicator(None))
 
             if self.tor_process:
                 if self.tor_process.poll() is not None:
                     self.tor_process = None
                     self.log("Tor process terminated unexpectedly.")
-                    self.root.after(0, lambda: self.tor_status_var.set("Tor: Stopped"))
-                    self.root.after(
-                        0, lambda: self.tor_status_label.config(fg="#ff0000")
+                    self.call_in_ui(lambda: self.tor_status_var.set("Tor: Stopped"))
+                    self.call_in_ui(
+                        lambda: self.tor_status_label.config(fg="#ff0000")
                     )
 
             for _ in range(30):
-                if not self.should_run:
+                if not self.app_running:
                     return
                 time.sleep(1)
 
@@ -3893,10 +3957,35 @@ class BZLobbyMonitor:
         self.proxy_status_canvas.itemconfig(self.proxy_status_light, fill=color)
 
     # --- Logging Tools ---
+    def get_log_folder(self):
+        folder = str(self.config.get("log_folder", "")).strip()
+        if folder and os.path.isdir(folder):
+            return folder
+        return APP_DIR
+
+    def get_stats_file(self):
+        return os.path.join(self.get_log_folder(), "bzr_stats.csv")
+
     def cleanup_logs(self):
-        retention = self.config.get("log_retention", 7)
-        # Implementation left simple: user can manually delete for now or expand later
-        pass
+        """Delete daily chat/event logs older than the retention period."""
+        try:
+            retention = max(1, int(self.config.get("log_retention", 7) or 7))
+            cutoff = datetime.now().date() - timedelta(days=retention)
+            folder = self.get_log_folder()
+            for fname in os.listdir(folder):
+                m = re.fullmatch(r"bzr_log_(\d{4}-\d{2}-\d{2})\.txt", fname)
+                if not m:
+                    continue
+                try:
+                    day = datetime.strptime(m.group(1), "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                if day < cutoff:
+                    os.remove(os.path.join(folder, fname))
+        except Exception as e:
+            print(f"Log cleanup failed: {e}")
+        # Re-check a few times a day for long-running sessions.
+        self.root.after(6 * 3600 * 1000, self.cleanup_logs)
 
     def toggle_stats_logging(self):
         self.save_ui_config()
@@ -3905,70 +3994,64 @@ class BZLobbyMonitor:
         self.draw_stats()
 
     def start_stats_logger(self):
-        threading.Thread(target=self._stats_logger_loop, daemon=True).start()
+        # Runs on the Tk timer (UI thread) so it never races lobby updates.
+        if self.stats_after_id is None:
+            self.stats_after_id = self.root.after(1000, self._stats_tick)
 
-    def _stats_logger_loop(self):
-        while self.should_run and self.config.get("stats_enabled", False):
-            try:
-                if self.lobbies:
-                    log_folder = self.config.get("log_folder", "").strip()
-                    if not log_folder or not os.path.exists(log_folder):
-                        log_folder = os.path.dirname(os.path.abspath(__file__))
-                    filename = os.path.join(log_folder, "bzr_stats.csv")
-                    file_exists = os.path.isfile(filename)
+    def _stats_tick(self):
+        self.stats_after_id = None
+        if not self.app_running or not self.config.get("stats_enabled", False):
+            return
+        try:
+            if self.lobbies:
+                filename = self.get_stats_file()
+                file_exists = os.path.isfile(filename)
 
-                    with open(filename, "a", newline="", encoding="utf-8") as f:
-                        writer = csv.writer(f)
-                        if not file_exists:
-                            writer.writerow(
-                                [
-                                    "Timestamp",
-                                    "LobbyID",
-                                    "Name",
-                                    "Map",
-                                    "Players",
-                                    "MaxPlayers",
-                                    "Type",
-                                ]
-                            )
+                with open(filename, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    if not file_exists:
+                        writer.writerow(
+                            [
+                                "Timestamp",
+                                "LobbyID",
+                                "Name",
+                                "Map",
+                                "Players",
+                                "MaxPlayers",
+                                "Type",
+                            ]
+                        )
 
-                        timestamp = datetime.now().isoformat()
-                        for lid, lobby in self.lobbies.items():
-                            meta = lobby.get("metadata", {})
-                            users = lobby.get("users", {})
+                    timestamp = datetime.now().isoformat()
+                    for lid, lobby in self.lobbies.items():
+                        if not isinstance(lobby, dict):
+                            continue
+                        meta = lobby.get("metadata", {})
+                        if not isinstance(meta, dict):
+                            meta = {}
+                        users = lobby.get("users", {})
 
-                            # Parse map
-                            map_name = "?"
-                            if "ready" in meta:
-                                map_name = (
-                                    meta["ready"].split("*")[1]
-                                    if "*" in meta["ready"]
-                                    else "?"
-                                )
+                        writer.writerow(
+                            [
+                                timestamp,
+                                lid,
+                                meta.get("name", "Unknown"),
+                                extract_map_name_from_metadata(meta, default="?"),
+                                len(users) if isinstance(users, dict) else 0,
+                                lobby.get("memberLimit", 0),
+                                meta.get("gameType", "?"),
+                            ]
+                        )
+        except Exception as e:
+            print(f"Stats log error: {e}")
 
-                            writer.writerow(
-                                [
-                                    timestamp,
-                                    lid,
-                                    meta.get("name", "Unknown"),
-                                    map_name,
-                                    len(users),
-                                    lobby.get("memberLimit", 0),
-                                    meta.get("gameType", "?"),
-                                ]
-                            )
-            except Exception as e:
-                print(f"Stats log error: {e}")
-
-            # Log every 60 seconds
-            for _ in range(60):
-                if not self.should_run or not self.config.get("stats_enabled", False):
-                    return
-                time.sleep(1)
+        # Log every 60 seconds
+        self.stats_after_id = self.root.after(60 * 1000, self._stats_tick)
 
     # --- Discord Integration ---
     def toggle_discord_relay(self):
         self.save_ui_config()
+        self.discord_bot_id = None  # token may have changed; re-resolve
         if self.discord_enabled_var.get():
             if not self.discord_thread or not self.discord_thread.is_alive():
                 self.discord_thread = threading.Thread(
@@ -3977,48 +4060,72 @@ class BZLobbyMonitor:
                 self.discord_thread.start()
                 self.log("Discord Relay Started.")
 
+    def _discord_request(self, token, path, payload=None):
+        """Call the Discord REST API. Runs on worker threads only."""
+        data = None
+        method = "GET"
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            method = "POST"
+        req = urllib.request.Request(
+            f"https://discord.com/api/v10{path}", data=data, method=method
+        )
+        req.add_header("Authorization", f"Bot {token}")
+        req.add_header("User-Agent", "BZLobbyMonitor/1.0")
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with self.open_url(req) as r:
+                body = r.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                # Rate limited: wait as long as Discord asks before retrying.
+                try:
+                    retry = float(json.loads(e.read().decode("utf-8")).get("retry_after", 1))
+                except Exception:
+                    retry = 1.0
+                time.sleep(min(max(retry, 0.5), 30))
+            raise
+        return json.loads(body.decode("utf-8")) if body else None
+
+    def _resolve_discord_bot_id(self, token):
+        me = self._discord_request(token, "/users/@me")
+        self.discord_bot_id = str(me.get("id")) if me and me.get("id") else None
+        return me
+
     def test_discord_connection(self):
-        token = self.discord_token_var.get()
+        token = self.discord_token_var.get().strip()
         if not token:
             return
 
-        try:
-            req = urllib.request.Request("https://discord.com/api/v10/users/@me")
-            req.add_header("Authorization", f"Bot {token}")
-            req.add_header("User-Agent", "BZLobbyMonitor/1.0")
-
-            with urllib.request.urlopen(req) as r:
-                data = json.loads(r.read().decode("utf-8"))
-                self.discord_bot_id = data.get("id")
-                username = data.get("username")
-                messagebox.showinfo(
-                    "Success", f"Connected as {username} (ID: {self.discord_bot_id})"
-                )
+        def worker():
+            try:
+                me = self._resolve_discord_bot_id(token)
+                username = me.get("username")
                 self.log(f"Discord Bot Authenticated: {username}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Discord Connection Failed:\n{e}")
+                self.call_in_ui(
+                    messagebox.showinfo,
+                    "Success",
+                    f"Connected as {username} (ID: {self.discord_bot_id})",
+                )
+            except Exception as e:
+                self.call_in_ui(
+                    messagebox.showerror, "Error", f"Discord Connection Failed:\n{e}"
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def send_to_discord(self, message=None, embed=None):
-        token = self.discord_token_var.get()
-        chan_id = self.discord_channel_id_var.get()
-        if not token or not chan_id:
+        token = self.discord_token_var.get().strip()
+        chan_id = self.discord_channel_id_var.get().strip()
+        if not token or not chan_id.isdigit():
             return
+        # allowed_mentions blocks @everyone/@here/role pings from relayed chat.
+        payload = build_discord_message_payload(message=message, embed=embed)
 
         def _send():
             try:
-                url = f"https://discord.com/api/v10/channels/{chan_id}/messages"
-                payload = {}
-                if message:
-                    payload["content"] = message
-                if embed:
-                    payload["embeds"] = [embed]
-                data = json.dumps(payload).encode("utf-8")
-                req = urllib.request.Request(url, data=data, method="POST")
-                req.add_header("Authorization", f"Bot {token}")
-                req.add_header("Content-Type", "application/json")
-                req.add_header("User-Agent", "BZLobbyMonitor/1.0")
-                with urllib.request.urlopen(req) as r:
-                    pass
+                self._discord_request(token, f"/channels/{chan_id}/messages", payload)
             except Exception as e:
                 print(f"Discord Send Error: {e}")
 
@@ -4075,64 +4182,50 @@ class BZLobbyMonitor:
 
     def discord_polling_loop(self):
         last_id = None
+        last_error = None
 
-        # Initial fetch to get the latest message ID so we don't spam old messages
-        try:
-            token = self.discord_token_var.get()
-            chan_id = self.discord_channel_id_var.get()
-            if token and chan_id:
-                url = f"https://discord.com/api/v10/channels/{chan_id}/messages?limit=1"
-                req = urllib.request.Request(url)
-                req.add_header("Authorization", f"Bot {token}")
-                req.add_header("User-Agent", "BZLobbyMonitor/1.0")
-                with urllib.request.urlopen(req) as r:
-                    msgs = json.loads(r.read().decode("utf-8"))
-                    if msgs:
-                        last_id = msgs[0].get("id")
-        except:
-            pass
-
-        while self.should_run and self.discord_enabled_var.get():
+        # Reads self.config (kept current by save_ui_config), never Tk variables:
+        # this runs on a worker thread.
+        while self.app_running and self.config.get("discord_enabled", False):
             try:
-                token = self.discord_token_var.get()
-                chan_id = self.discord_channel_id_var.get()
-                if not token or not chan_id:
+                token = str(self.config.get("discord_token", "")).strip()
+                chan_id = str(self.config.get("discord_channel_id", "")).strip()
+                if not token or not chan_id.isdigit():
                     time.sleep(5)
                     continue
 
-                url = f"https://discord.com/api/v10/channels/{chan_id}/messages?limit=5"
-                if last_id:
-                    url += f"&after={last_id}"
+                # We must know our own id, or our relayed posts would echo back.
+                if not self.discord_bot_id:
+                    self._resolve_discord_bot_id(token)
 
-                req = urllib.request.Request(url)
-                req.add_header("Authorization", f"Bot {token}")
-                req.add_header("User-Agent", "BZLobbyMonitor/1.0")
+                if last_id is None:
+                    # Start from the newest message so old history isn't replayed.
+                    msgs = self._discord_request(token, f"/channels/{chan_id}/messages?limit=1") or []
+                    last_id = msgs[0].get("id") if msgs else "0"
+                    continue
 
-                with urllib.request.urlopen(req) as r:
-                    msgs = json.loads(r.read().decode("utf-8"))
+                msgs = self._discord_request(
+                    token, f"/channels/{chan_id}/messages?limit=50&after={last_id}"
+                ) or []
 
-                    # Process from oldest to newest
-                    for m in reversed(msgs):
-                        msg_id = m.get("id")
-                        author = m.get("author", {})
-                        author_id = author.get("id")
-                        content = m.get("content", "")
-
-                        if last_id and author_id != self.discord_bot_id:
-                            if self.discord_to_lobby_var.get() and self.connected:
-                                target_lobby = self.discord_lobby_id_var.get()
-                                if str(self.current_lobby_id) == str(target_lobby):
-                                    sender = author.get("username")
-                                    chat_line = f"[Discord] {sender}: {content}"
-                                    self.ws.send(
-                                        json.dumps(
-                                            {"type": "DoSendChat", "content": chat_line}
-                                        )
-                                    )
-
-                        last_id = msg_id
+                # Snowflake ids sort chronologically; process oldest first.
+                for m in sorted(msgs, key=lambda m: int(m.get("id", 0))):
+                    chat_line = should_relay_discord_message(
+                        m,
+                        bot_id=self.discord_bot_id,
+                        relay_to_lobby_enabled=self.config.get("discord_relay_to_lobby", True),
+                        connected=self.connected,
+                        current_lobby_id=self.current_lobby_id,
+                        target_lobby_id=self.config.get("discord_lobby_id", ""),
+                    )
+                    if chat_line:
+                        self.call_in_ui(self.send_chat_message, chat_line[:500])
+                    last_id = m.get("id", last_id)
+                last_error = None
             except Exception as e:
-                pass
+                if str(e) != last_error:
+                    last_error = str(e)
+                    self.log(f"Discord relay error: {e}")
             time.sleep(2)
 
     # --- Bot & RPC & Stats ---
@@ -4140,15 +4233,15 @@ class BZLobbyMonitor:
         threading.Thread(target=self.bot_loop, daemon=True).start()
 
     def bot_loop(self):
-        while self.should_run:
+        while self.app_running:
             if self.connected and self.current_lobby_id is not None:
                 # Standard Announcements
                 if self.config.get("bot_announce_enabled", False):
-                    interval = self.config.get("bot_announce_interval", 5) * 60
+                    interval = int(self.config.get("bot_announce_interval", 5) or 5) * 60
                     if time.time() - self.last_announce_time > interval:
                         msg = self.config.get("bot_announce_msg", "")
                         if msg:
-                            self.send_chat_message(msg)
+                            self.call_in_ui(self.send_chat_message, msg)
                             self.last_announce_time = time.time()
 
                 # Timed Event Announcements
@@ -4164,7 +4257,7 @@ class BZLobbyMonitor:
 
                             if start_dt <= now <= end_dt:
                                 evt_interval = (
-                                    self.config.get("bot_event_interval", 10) * 60
+                                    int(self.config.get("bot_event_interval", 10) or 10) * 60
                                 )
                                 if (
                                     time.time() - self.last_event_announce_time
@@ -4172,7 +4265,7 @@ class BZLobbyMonitor:
                                 ):
                                     evt_msg = self.config.get("bot_event_msg", "")
                                     if evt_msg:
-                                        self.send_chat_message(evt_msg)
+                                        self.call_in_ui(self.send_chat_message, evt_msg)
                                         self.last_event_announce_time = time.time()
                     except ValueError:
                         pass  # Invalid date format
@@ -4198,9 +4291,8 @@ class BZLobbyMonitor:
 
         found = False
         for lid, lobby in self.lobbies.items():
-            meta = lobby.get("metadata", {})
-            raw_name = meta.get("name", "")
-            clean_name = raw_name.split("~~")[-1] if "~~" in raw_name else raw_name
+            meta = lobby.get("metadata", {}) if isinstance(lobby, dict) else {}
+            clean_name = clean_lobby_name(meta.get("name"), default="")
             if clean_name.lower() == target_name.lower():
                 found = True
                 break
@@ -4210,7 +4302,7 @@ class BZLobbyMonitor:
 
             # Force name reclaim in case we were using a backup name (e.g. !BRIDGE(1))
             bot_name = self.config.get("auto_claim_bot_name", "")
-            if bot_name:
+            if bot_name and self.ws:
                 self.log(f"Reclaiming identity: {bot_name}")
                 self.ws.send(
                     json.dumps(
@@ -4235,20 +4327,35 @@ class BZLobbyMonitor:
     def get_geo_info(self, ip):
         if ip in self.geo_cache:
             return self.geo_cache[ip]
+        try:
+            if not ipaddress.ip_address(str(ip)).is_global:
+                return None  # private/LAN addresses have no useful location
+        except ValueError:
+            return None
+        # One request per address, and back off after failures (ip-api allows
+        # 45 requests/minute).
+        if ip in self.geo_pending or time.time() - self.geo_failed.get(ip, 0) < 600:
+            return None
+        if len(self.geo_pending) >= 4:
+            return None
+        self.geo_pending.add(ip)
 
         def _fetch():
             try:
-                with urllib.request.urlopen(
-                    f"http://ip-api.com/json/{ip}?fields=status,countryCode,timezone,offset"
-                ) as r:
+                req = f"http://ip-api.com/json/{ip}?fields=status,countryCode,timezone,offset"
+                with self.open_url(req) as r:
                     data = json.loads(r.read().decode())
-                    if data.get("status") == "success":
-                        info = f"[{data.get('countryCode')}] {data.get('timezone')}"
-                        self.geo_cache[ip] = info
-                        # Refresh UI if this player is currently shown
-                        self.root.after(0, lambda: self.on_lobby_select(None))
-            except:
-                pass
+                if data.get("status") == "success":
+                    info = f"[{data.get('countryCode')}] {data.get('timezone')}"
+                    self.geo_cache[ip] = info
+                    # Refresh UI if this player is currently shown
+                    self.call_in_ui(self.on_lobby_select, None)
+                else:
+                    self.geo_failed[ip] = time.time()
+            except Exception:
+                self.geo_failed[ip] = time.time()
+            finally:
+                self.geo_pending.discard(ip)
 
         threading.Thread(target=_fetch, daemon=True).start()
         return None
@@ -4288,10 +4395,43 @@ class BZLobbyMonitor:
                     large_image="bz98_icon",
                     large_text="Battlezone 98 Redux",
                 )
-            except:
+            except Exception:
                 pass
 
     def draw_stats(self):
+        """Reload the stats CSV in the background, then redraw."""
+        if not self.config.get("stats_enabled", False):
+            self.stats_points = None
+            self._render_stats()
+            return
+        if self.stats_loading:
+            return
+        self.stats_loading = True
+        filename = self.get_stats_file()
+
+        def load():
+            points = []
+            try:
+                if os.path.exists(filename):
+                    with open(filename, "r", encoding="utf-8", newline="") as f:
+                        reader = csv.reader(f)
+                        next(reader, None)  # Skip header
+                        # One snapshot per minute; sum all lobbies in a snapshot.
+                        points = aggregate_recent_player_counts(reader, bucket_minutes=1)
+                else:
+                    points = None
+            except Exception as e:
+                print(f"Stats read error: {e}")
+            self.call_in_ui(self._stats_loaded, points)
+
+        threading.Thread(target=load, daemon=True).start()
+
+    def _stats_loaded(self, points):
+        self.stats_loading = False
+        self.stats_points = points
+        self._render_stats()
+
+    def _render_stats(self):
         self.stats_canvas.delete("all")
         w = self.stats_canvas.winfo_width()
         h = self.stats_canvas.winfo_height()
@@ -4310,60 +4450,22 @@ class BZLobbyMonitor:
         if w < 50:
             return
 
-        log_folder = self.config.get("log_folder", "").strip()
-        if not log_folder or not os.path.exists(log_folder):
-            log_folder = os.path.dirname(os.path.abspath(__file__))
-        filename = os.path.join(log_folder, "bzr_stats.csv")
-        if not os.path.exists(filename):
+        sorted_pts = self.stats_points
+        if sorted_pts is None:
             self.stats_canvas.create_text(
                 w / 2, h / 2, text="No stats data found.", fill="white"
             )
             return
-
-        data_points = {}  # timestamp -> total_players
-
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                next(reader, None)  # Skip header
-                for row in reader:
-                    if len(row) < 5:
-                        continue
-                    ts_str = row[0]
-                    try:
-                        dt = datetime.fromisoformat(ts_str)
-                        # Filter last 24h
-                        if datetime.now() - dt > timedelta(hours=24):
-                            continue
-                        players = int(row[4])
-                        # Sum players per snapshot (each snapshot = one exact ISO timestamp)
-                        if ts_str not in data_points:
-                            data_points[ts_str] = 0
-                        data_points[ts_str] += players
-                    except:
-                        pass
-        except:
-            pass
-
-        if not data_points:
+        if not sorted_pts:
             return
 
-        sorted_pts = sorted(
-            [(datetime.fromisoformat(k), v) for k, v in data_points.items()],
-            key=lambda x: x[0],
-        )
-
-        max_p = max([p[1] for p in sorted_pts]) if sorted_pts else 10
-        if max_p == 0:
-            max_p = 10
+        max_p = max(p[1] for p in sorted_pts) or 10
 
         # Draw
         pad = 40
         prev_x, prev_y = None, None
         start_time = sorted_pts[0][0]
-        total_seconds = (sorted_pts[-1][0] - start_time).total_seconds()
-        if total_seconds == 0:
-            total_seconds = 1
+        total_seconds = (sorted_pts[-1][0] - start_time).total_seconds() or 1
 
         for dt, count in sorted_pts:
             secs = (dt - start_time).total_seconds()
@@ -4416,7 +4518,7 @@ class BZLobbyMonitor:
                 for ip in socket.gethostbyname_ex(socket.gethostname())[2]
                 if not ip.startswith("127.")
             ]
-        except:
+        except Exception:
             pass
         if not local_ips:
             local_ips = ["0.0.0.0"]
@@ -4427,7 +4529,7 @@ class BZLobbyMonitor:
                 try:
                     ip_bytes = socket.inet_aton(local_ips[i])
                     msg.extend(bytes([b ^ 0xFF for b in ip_bytes]))
-                except:
+                except Exception:
                     msg.extend(b"\xff" * 4)
             else:
                 msg.extend(b"\xff" * 4)
@@ -4449,22 +4551,35 @@ class BZLobbyMonitor:
 
         return bytes(frame)
 
+    def start_http_lobby_poll(self):
+        # At most one poll in flight; a slow server must not pile up threads.
+        if self.http_poll_inflight:
+            return
+        self.http_poll_inflight = True
+        threading.Thread(target=self.poll_http_lobby, daemon=True).start()
+
     def poll_http_lobby(self):
         try:
             url = "http://battlezone99mp.webdev.rebellion.co.uk/lobbyServer/"
             req = urllib.request.Request(url, method="GET")
 
-            with urllib.request.urlopen(req, timeout=5) as f:
+            with self.open_url(req, timeout=5) as f:
                 res = json.load(f)
-                if "GET" in res:
-                    games = res["GET"]
-                    self.log(f"HTTP Lobby: Found {len(games)} games.")
-                    self.process_bzcc_data(res)
+            if isinstance(res, dict) and "GET" in res:
+                games = res["GET"]
+                self.log(f"HTTP Lobby: Found {len(games)} games.")
+                self.call_in_ui(self.process_bzcc_data, res)
         except Exception as e:
             self.log(f"HTTP Poll Failed: {e}")
+        finally:
+            self.http_poll_inflight = False
+
+
+def main():
+    root = tk.Tk()
+    BZLobbyMonitor(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = BZLobbyMonitor(root)
-    root.mainloop()
+    main()

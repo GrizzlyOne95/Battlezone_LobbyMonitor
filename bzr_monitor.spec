@@ -5,12 +5,12 @@ a = Analysis(
     ['bzr_monitor.py'],
     pathex=[],
     binaries=[],
+    # Never bundle bzr_monitor_config.json: it holds the local Discord bot token.
     datas=[
-        ('bzr_monitor_config.json', '.'),
         ('branding/app_icon.ico', 'branding'),
         ('branding/app_icon.png', 'branding'),
     ],
-    hiddenimports=[],
+    hiddenimports=['socks', 'sockshandler', 'python_socks'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=['branding/pyinstaller_icon_hook.py'],

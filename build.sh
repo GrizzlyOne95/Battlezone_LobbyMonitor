@@ -16,13 +16,14 @@ pip install pyinstaller
 pyinstaller --name "${APP_NAME}" \
     --onefile \
     --windowed \
-    --add-data "bzr_monitor_config.json:." \
     --add-data "LICENSE:." \
     --add-data "README.md:." \
     --hidden-import=websocket \
     --hidden-import=pystray \
     --hidden-import=pypresence \
-    --hidden-import=pysocks \
+    --hidden-import=socks \
+    --hidden-import=sockshandler \
+    --hidden-import=python_socks \
     --hidden-import=PIL \
     bzr_monitor.py
 
@@ -35,11 +36,12 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
     tar -czf "../releases/${ARCHIVE_PREFIX}-linux-x64.tar.gz" "${APP_NAME}"
     cd ..
 elif [[ "$OSTYPE" == "darwin"* ]]; then
+    MAC_ARCH="$(uname -m | sed s/x86_64/x64/)"
     cd dist
     if [ -d "${APP_NAME}.app" ]; then
-        zip -qr "../releases/${ARCHIVE_PREFIX}-macos-x64.zip" "${APP_NAME}.app"
+        zip -qr "../releases/${ARCHIVE_PREFIX}-macos-${MAC_ARCH}.zip" "${APP_NAME}.app"
     else
-        tar -czf "../releases/${ARCHIVE_PREFIX}-macos-x64.tar.gz" "${APP_NAME}"
+        tar -czf "../releases/${ARCHIVE_PREFIX}-macos-${MAC_ARCH}.tar.gz" "${APP_NAME}"
     fi
     cd ..
 fi
