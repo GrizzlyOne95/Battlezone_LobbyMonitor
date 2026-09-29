@@ -29,9 +29,9 @@ A comprehensive external tool for monitoring, interacting with, and automating B
 *   **Auto-Reconnect**: Automatically attempts to re-establish connection to the server if dropped.
 
 ### 🛡️ Security & Privacy
-*   **Proxy Support**: Route WebSocket traffic through a custom or public proxy to mask your IP address.
-*   **IP Safety Switch**: Optional configuration to block all connections if the proxy is not verified as working.
-*   **Griefer Detection**: Built-in alerting system for known disruptive player IDs.
+*   **Proxy Support**: Route the BZ98R WebSocket connection and the app's web lookups (Steam images, geo lookups, Discord, BZCC HTTP) through an HTTP or SOCKS5/Tor proxy. BZCC RakNet (UDP) monitoring can't be proxied.
+*   **IP Safety Switch**: Blocks connections and lookups unless they can go through a verified proxy, and refuses to start BZCC UDP monitoring.
+*   **Griefer Detection**: Alerts when player IDs from a configurable griefer list join a lobby.
 *   **Watch List**: Configure alerts (Sound/Flash) when specific players join any lobby.
 
 ### 📊 Analytics & Logging
@@ -46,7 +46,7 @@ A comprehensive external tool for monitoring, interacting with, and automating B
 
 ## Installation
 
-1.  **Install Python 3.x**: Ensure Python is installed on your system.
+1.  **Install Python 3.8+**: Ensure Python is installed on your system.
 2.  **Install Dependencies**:
     ```bash
     pip install -r requirements.txt
@@ -86,6 +86,7 @@ To use the Relay features, navigate to the **Discord Integration** tab:
 *   `Pillow`: For processing map and mod preview images.
 *   `pypresence`: For Discord Rich Presence support.
 *   `pystray`: For system tray and passive/background operation.
+*   `pysocks` / `python-socks`: For SOCKS5 (Tor) proxies.
 
 ## Supported Games
 

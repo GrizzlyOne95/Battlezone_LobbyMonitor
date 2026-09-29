@@ -6,7 +6,7 @@ This document describes how to build releases for all platforms.
 
 ### Prerequisites
 
-- Python 3.6+
+- Python 3.8+
 - PyInstaller (`pip install pyinstaller`)
 - All dependencies from requirements.txt
 
@@ -20,7 +20,7 @@ python -m pip install pyinstaller
 
 # Build executable
 python -m PyInstaller --name "bzr_monitor" --onefile --windowed ^
-    --add-data "bzr_monitor_config.json:." bzr_monitor.py -y
+    bzr_monitor.py -y
 
 # The executable will be in dist/bzr_monitor.exe
 # Create a zip archive:
@@ -35,7 +35,7 @@ python3 -m pip install pyinstaller
 
 # Build executable
 python3 -m PyInstaller --name "bzr_monitor" --onefile --windowed \
-    --add-data "bzr_monitor_config.json:." bzr_monitor.py -y
+    bzr_monitor.py -y
 
 # Create a zip archive
 cd dist
@@ -50,7 +50,7 @@ python3 -m pip install pyinstaller
 
 # Build executable
 python3 -m PyInstaller --name "bzr_monitor" --onefile --windowed \
-    --add-data "bzr_monitor_config.json:." bzr_monitor.py -y
+    bzr_monitor.py -y
 
 # Create a tar archive
 cd dist
