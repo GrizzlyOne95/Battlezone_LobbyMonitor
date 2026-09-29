@@ -5,6 +5,6 @@ __pycache__/
 *.pyd
 bzr_stats.csv
 *.vsix
-bin/tor/data/
+bin/tor/
 bzr_monitor_config.json.tmp
 bzr_log_*.txt
