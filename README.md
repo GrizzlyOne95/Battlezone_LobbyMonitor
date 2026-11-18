@@ -68,9 +68,11 @@ python -m unittest discover -s tests -v
 
 All settings can be managed via the **Configuration** tab in the application:
 
+Settings save automatically as you change them. They are stored in `bzr_monitor_config.json` next to the app, or, if that folder is read-only, in your user data folder (`%APPDATA%\BZLobbyMonitor`, `~/Library/Application Support/BZLobbyMonitor`, or `~/.config/BZLobbyMonitor`).
+
 *   **Connection**: Set Auto-Reconnect delay.
 *   **Proxy**: Configure Host/Port and enable IP Safety.
-*   **Window**: Toggle "Minimize to Taskbar" and "Run on Startup".
+*   **Window**: Toggle "Minimize on Close" (tray on Windows/Linux, Dock on macOS) and "Run on System Startup" (Windows registry, macOS LaunchAgent, Linux autostart).
 *   **Logging**: Enable/Disable file logging and set retention period.
 *   **Alerts**: Toggle sounds and window flashing for various events.
 

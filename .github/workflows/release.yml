@@ -107,7 +107,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -139,6 +139,7 @@ jobs:
             --version-file "branding/version_info.txt" `
             --add-data "branding/app_icon.ico;branding" `
             --add-data "branding/app_icon.png;branding" `
+            --add-data "BZONE.ttf;." `
             --add-data "LICENSE:." `
             --add-data "README.md:." `
             --runtime-hook branding/pyinstaller_icon_hook.py `
@@ -158,6 +159,7 @@ jobs:
             --icon "branding/app_icon.ico" \
             --add-data "branding/app_icon.ico:branding" \
             --add-data "branding/app_icon.png:branding" \
+            --add-data "BZONE.ttf:." \
             --add-data "LICENSE:." \
             --add-data "README.md:." \
             --runtime-hook branding/pyinstaller_icon_hook.py \
@@ -178,6 +180,7 @@ jobs:
             --icon "branding/app_icon.ico" \
             --add-data "branding/app_icon.ico:branding" \
             --add-data "branding/app_icon.png:branding" \
+            --add-data "BZONE.ttf:." \
             --add-data "LICENSE:." \
             --add-data "README.md:." \
             --runtime-hook branding/pyinstaller_icon_hook.py \
@@ -211,7 +214,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
