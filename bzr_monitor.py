@@ -28,6 +28,9 @@ import urllib.error
 from datetime import datetime, timedelta
 import tarfile
 import subprocess
+import shutil
+import tempfile
+import plistlib
 
 from bzr_monitor_utils import (
     aggregate_recent_player_counts,
@@ -36,6 +39,7 @@ from bzr_monitor_utils import (
     build_lobby_share_text,
     build_steam_join_url,
     clean_lobby_name,
+    extract_lobby_version,
     extract_map_name_from_game_settings,
     extract_map_name_from_metadata,
     format_game_settings_summary,
@@ -52,15 +56,20 @@ if sys.platform == "win32":
     import winreg
     import winsound
 
-try:
-    import pystray
-    from pystray import MenuItem as item
+HAS_TRAY = False
+if sys.platform != "darwin":
+    # On macOS pystray must own the main thread (NSApplication), which Tk
+    # already does; running it on a worker thread crashes the app. macOS uses
+    # the Dock instead (see on_window_close_attempt).
+    try:
+        import pystray
+        from pystray import MenuItem as item
 
-    HAS_TRAY = True
-except Exception:
-    # pystray raises ValueError (not ImportError) when no tray backend such
-    # as GTK is available, e.g. on minimal Linux desktops.
-    HAS_TRAY = False
+        HAS_TRAY = True
+    except Exception:
+        # pystray raises ValueError (not ImportError) when no tray backend such
+        # as GTK is available, e.g. on minimal Linux desktops.
+        HAS_TRAY = False
 
 # Try to import pypresence for Discord RPC
 try:
@@ -106,9 +115,120 @@ def _app_dir():
 
 APP_DIR = _app_dir()
 CONFIG_NAME = "bzr_monitor_config.json"
-CONFIG_FILE = os.path.join(APP_DIR, CONFIG_NAME)
+
+
+def _is_writable_dir(path):
+    # os.access() is unreliable on Windows (Program Files) and macOS (App
+    # Translocation), so actually try to create a file.
+    try:
+        fd, tmp = tempfile.mkstemp(dir=path, prefix=".bzr_write_test")
+        os.close(fd)
+        os.remove(tmp)
+        return True
+    except OSError:
+        return False
+
+
+def _user_data_dir():
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "BZLobbyMonitor")
+
+
+def _data_dir():
+    """Where config, logs, stats and Tor live.
+
+    Next to the app as before, unless that folder is read-only (Program Files,
+    a mounted DMG, a translocated macOS download), in which case settings
+    would silently never be saved; then use the per-user data folder.
+    """
+    if _is_writable_dir(APP_DIR):
+        return APP_DIR
+    user_dir = _user_data_dir()
+    try:
+        os.makedirs(user_dir, exist_ok=True)
+    except OSError:
+        pass
+    return user_dir
+
+
+DATA_DIR = _data_dir()
+CONFIG_FILE = os.path.join(DATA_DIR, CONFIG_NAME)
+
+if sys.platform == "win32":
+    MONO_FONT, UI_FONT = "Consolas", "Segoe UI"
+elif sys.platform == "darwin":
+    MONO_FONT, UI_FONT = "Menlo", "Helvetica Neue"
+else:
+    MONO_FONT, UI_FONT = "DejaVu Sans Mono", "DejaVu Sans"
+
+
+def _external_env():
+    """Environment for launching system programs.
+
+    A PyInstaller build on Linux points LD_LIBRARY_PATH at its bundled
+    libraries, which breaks xdg-open, browsers and audio players.
+    """
+    env = dict(os.environ)
+    if getattr(sys, "frozen", False) and sys.platform.startswith("linux"):
+        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig is not None:
+            env["LD_LIBRARY_PATH"] = orig
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
+def open_external(url):
+    """Open a web or steam:// link with the system handler on every OS."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", url], env=_external_env())
+            return True
+        if sys.platform.startswith("linux") and shutil.which("xdg-open"):
+            subprocess.Popen(
+                ["xdg-open", url],
+                env=_external_env(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+    except Exception:
+        pass
+    return webbrowser.open(url)
+
+
+def play_wav_file(path):
+    """Play a .wav without blocking. Returns True if a player was started."""
+    if sys.platform == "win32":
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        return True
+    if sys.platform == "darwin":
+        players = ["afplay"]
+    else:
+        players = ["paplay", "pw-play", "aplay"]
+    for player in players:
+        exe = shutil.which(player)
+        if exe:
+            subprocess.Popen(
+                [exe, path],
+                env=_external_env(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+    return False
 DEFAULT_GRIEFER_IDS = "S76561198297657246"
 TOR_DOWNLOAD_PAGE = "https://www.torproject.org/download/tor/"
+DEFAULT_HOSTS = {
+    "Battlezone 98 Redux": "battlezone98mp.webdev.rebellion.co.uk:1337",
+    "Battlezone Combat Commander": "battlezone99mp.webdev.rebellion.co.uk:61111",
+}
+MAX_LOG_LINES = 5000
 HTTP_TIMEOUT = 10
 
 # websocket-client needs python-socks (not pysocks) for SOCKS proxies.
@@ -127,7 +247,7 @@ def _set_app_user_model_id():
 
 
 def _resolve_bundled_icon(name):
-    """Locate a bundled icon working from source and under sys._MEIPASS."""
+    """Locate a bundled file (icon, font) from source and under sys._MEIPASS."""
     candidates = []
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
@@ -229,6 +349,17 @@ class BZLobbyMonitor:
         self.tor_process = None
         self.raknet_query = None  # Custom payload for RakNet connected state
         self.tx_rel_seq = -1  # Reliable Message Sequence Number
+        self.tor_downloading = False
+        self.pending_lobby_name = None  # name of the lobby we asked to create
+        self.recent_kicks = {}
+        self.bzcc_primed = False  # first BZCC snapshot seen for this connection
+        self.last_http_game_count = None
+        self.raknet_query_logged = False
+        self.event_format_warned = False
+        self.discord_last_send_error = None
+        self.sort_state = None  # (column, reverse) chosen by the user
+        self._save_after_id = None
+        self.config_warning = None
 
         self.colors = {}
         self.load_config()
@@ -236,6 +367,16 @@ class BZLobbyMonitor:
         self.setup_styles()
         self.setup_ui()
         self.apply_config()
+        self._attach_autosave()
+        if self.config_warning:
+            self.log(self.config_warning)
+
+        if sys.platform == "darwin":
+            # Clicking the Dock icon brings a minimized/hidden window back.
+            try:
+                self.root.createcommand("::tk::mac::ReopenApplication", self.show_window)
+            except Exception:
+                pass
 
         # Start stats logger if enabled
         if self.config.get("stats_enabled", False):
@@ -263,6 +404,9 @@ class BZLobbyMonitor:
 
     def load_config(self):
         self.config = {
+            "player_name": "BZMonitorUser",
+            "lobby_game": "Battlezone 98 Redux",
+            "lobby_host": "",
             "proxy_enabled": False,
             "proxy_host": "",
             "proxy_port": "",
@@ -315,8 +459,13 @@ class BZLobbyMonitor:
             "sound_griefer": "",
             "griefer_ids": DEFAULT_GRIEFER_IDS,
         }
-        # Older versions kept the config in the working directory.
-        for path in (CONFIG_FILE, os.path.abspath(CONFIG_NAME)):
+        # Older versions kept the config in the working directory, or next to
+        # the app when that folder is read-only now.
+        candidates = []
+        for path in (CONFIG_FILE, os.path.join(APP_DIR, CONFIG_NAME), os.path.abspath(CONFIG_NAME)):
+            if path not in candidates:
+                candidates.append(path)
+        for path in candidates:
             if os.path.exists(path):
                 try:
                     with open(path, "r", encoding="utf-8") as f:
@@ -326,21 +475,30 @@ class BZLobbyMonitor:
                     break
                 except Exception as e:
                     print(f"Failed to load config {path}: {e}", file=sys.stderr)
+                    # Keep the unreadable file instead of overwriting it with
+                    # defaults on the next save.
+                    backup = path + ".corrupt"
+                    try:
+                        os.replace(path, backup)
+                        self.config_warning = (
+                            f"Settings file could not be read ({e}); defaults loaded. "
+                            f"The old file was kept as {backup}"
+                        )
+                    except OSError:
+                        self.config_warning = f"Settings file could not be read ({e}); defaults loaded."
 
     def load_custom_fonts(self):
-        self.custom_font_name = "Consolas"
+        self.custom_font_name = MONO_FONT
         if sys.platform == "win32":
-            # Try to load BZONE.ttf if it exists in the same dir
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            font_path = os.path.join(base_dir, "BZONE.ttf")
-            if os.path.exists(font_path):
+            # Load the bundled BZONE.ttf privately (works from source and
+            # from the PyInstaller bundle).
+            font_path = _resolve_bundled_icon("BZONE.ttf")
+            if font_path:
                 try:
                     if ctypes.windll.gdi32.AddFontResourceExW(font_path, 0x10, 0) > 0:
                         self.custom_font_name = "BZONE"
                 except Exception:
                     pass
-        else:
-            self.custom_font_name = "Monospace"
 
     def setup_styles(self):
         self.colors = {
@@ -425,14 +583,22 @@ class BZLobbyMonitor:
         if not button:
             return
         try:
-            original_text = button.cget("text")
+            # Remember the real label once; a second click while a message is
+            # showing must not make the message the button's permanent text.
+            if not hasattr(button, "_flash_original"):
+                button._flash_original = button.cget("text")
+            pending = getattr(button, "_flash_after", None)
+            if pending:
+                self.root.after_cancel(pending)
             button.config(text=text)
-            self.root.after(
-                duration,
-                lambda: (
-                    button.config(text=original_text) if button.winfo_exists() else None
-                ),
-            )
+
+            def restore():
+                button._flash_after = None
+                if button.winfo_exists():
+                    button.config(text=button._flash_original)
+                del button._flash_original
+
+            button._flash_after = self.root.after(duration, restore)
         except Exception:
             pass
 
@@ -559,13 +725,27 @@ class BZLobbyMonitor:
         canvas.bind("<Configure>", _configure_canvas)
 
         def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            # Linux/X11 sends Button-4/5; Windows sends multiples of 120;
+            # macOS sends small deltas (often 1-3).
+            if getattr(event, "num", None) == 4:
+                step = -1
+            elif getattr(event, "num", None) == 5:
+                step = 1
+            else:
+                delta = event.delta
+                if abs(delta) >= 120:
+                    delta = int(delta / 120)
+                step = -delta
+            if step:
+                canvas.yview_scroll(step, "units")
 
         def _bind_mousewheel(event):
-            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                canvas.bind_all(seq, _on_mousewheel)
 
         def _unbind_mousewheel(event):
-            canvas.unbind_all("<MouseWheel>")
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                canvas.unbind_all(seq)
 
         scrollable_frame.bind("<Enter>", _bind_mousewheel)
         scrollable_frame.bind("<Leave>", _unbind_mousewheel)
@@ -586,18 +766,24 @@ class BZLobbyMonitor:
             "Battlezone 98 Redux",
             "Battlezone Combat Commander",
         )
-        self.game_combo.current(0)
+        saved_game = self.config.get("lobby_game")
+        if saved_game in self.game_combo["values"]:
+            self.game_combo.set(saved_game)
+        else:
+            self.game_combo.current(0)
         self.game_combo.pack(side="left", padx=2)
         self.game_combo.bind("<<ComboboxSelected>>", self.on_game_select)
 
         ttk.Label(top_frame, text="Name:").pack(side="left", padx=2)
-        self.name_var = tk.StringVar(value="BZMonitorUser")
+        self.name_var = tk.StringVar(value=self.config.get("player_name") or "BZMonitorUser")
         ttk.Entry(top_frame, textvariable=self.name_var, width=15).pack(
             side="left", padx=2
         )
 
         ttk.Label(top_frame, text="Host:").pack(side="left", padx=2)
-        self.host_var = tk.StringVar(value="battlezone98mp.webdev.rebellion.co.uk:1337")
+        self.host_var = tk.StringVar(
+            value=self.config.get("lobby_host") or DEFAULT_HOSTS.get(self.game_var.get(), "")
+        )
         ttk.Entry(top_frame, textvariable=self.host_var, width=40).pack(
             side="left", padx=2
         )
@@ -680,13 +866,13 @@ class BZLobbyMonitor:
             action_frame,
             text="Hide Locked",
             variable=self.filter_locked_var,
-            command=self.refresh_tree,
+            command=self._on_filter_changed,
         ).pack(side="left", padx=2)
         ttk.Checkbutton(
             action_frame,
             text="Hide Full",
             variable=self.filter_full_var,
-            command=self.refresh_tree,
+            command=self._on_filter_changed,
         ).pack(side="left", padx=2)
 
         # Main Content: PanedWindow
@@ -743,7 +929,7 @@ class BZLobbyMonitor:
             bg="#050505",
             fg=self.colors["fg"],
             insertbackground=self.colors["highlight"],
-            font=("Consolas", 9),
+            font=(MONO_FONT, 9),
             wrap="word",
         )
         self.waiting_room_text.pack(fill="both", expand=True)
@@ -769,7 +955,7 @@ class BZLobbyMonitor:
             bg="#050505",
             fg=self.colors["fg"],
             insertbackground=self.colors["highlight"],
-            font=("Consolas", 9),
+            font=(MONO_FONT, 9),
         )
         self.lobby_details_text.pack(fill="both", expand=True)
 
@@ -785,7 +971,7 @@ class BZLobbyMonitor:
             bg="#050505",
             fg=self.colors["fg"],
             insertbackground=self.colors["highlight"],
-            font=("Consolas", 9),
+            font=(MONO_FONT, 9),
         )
         self.log_text.pack(fill="both", expand=True)
 
@@ -814,10 +1000,15 @@ class BZLobbyMonitor:
             bg="#050505",
             fg=self.colors["fg"],
             insertbackground=self.colors["highlight"],
-            font=("Consolas", 9),
+            font=(MONO_FONT, 9),
         )
         self.player_details_text.pack(fill="both", expand=True)
-        self.player_details_text.bind("<Button-3>", self.show_player_context_menu)
+        # Right-click is Button-3 on Windows/Linux, Button-2 or Ctrl+Click on macOS.
+        context_seqs = ["<Button-3>"]
+        if sys.platform == "darwin":
+            context_seqs += ["<Button-2>", "<Control-Button-1>"]
+        for seq in context_seqs:
+            self.player_details_text.bind(seq, self.show_player_context_menu)
 
         # Configure tags for links
         for widget in [
@@ -831,13 +1022,13 @@ class BZLobbyMonitor:
             )
             widget.tag_bind("link", "<Leave>", lambda e, w=widget: w.config(cursor=""))
             widget.tag_bind("link", "<Button-1>", self.on_link_click)
-            widget.tag_config("griefer", foreground="red", font=("Segoe UI", 9, "bold"))
-            widget.tag_config("host", foreground="#ffcc00", font=("Segoe UI", 9, "bold"))
-            widget.tag_config("team_header", foreground=self.colors["highlight"], font=("Segoe UI", 9, "bold"))
+            widget.tag_config("griefer", foreground="red", font=(UI_FONT, 9, "bold"))
+            widget.tag_config("host", foreground="#ffcc00", font=(UI_FONT, 9, "bold"))
+            widget.tag_config("team_header", foreground=self.colors["highlight"], font=(UI_FONT, 9, "bold"))
             widget.tag_config(
                 "friend",
                 foreground=self.colors["highlight"],
-                font=("Segoe UI", 9, "bold"),
+                font=(UI_FONT, 9, "bold"),
             )
 
         # Chat specific tags
@@ -937,7 +1128,7 @@ class BZLobbyMonitor:
             textvariable=self.tor_status_var,
             fg="#666666",
             bg=self.colors["bg"],
-            font=("Segoe UI", 9),
+            font=(UI_FONT, 9),
         )
         self.tor_status_label.pack(side="left", padx=5)
 
@@ -957,14 +1148,18 @@ class BZLobbyMonitor:
         self.min_close_var = tk.BooleanVar(value=self.config["minimize_on_close"])
         ttk.Checkbutton(
             win_frame,
-            text="Minimize to Taskbar on Close (Passive Mode)",
+            text=(
+                "Minimize to Dock on Close (Passive Mode)"
+                if sys.platform == "darwin"
+                else "Minimize to Tray/Taskbar on Close (Passive Mode)"
+            ),
             variable=self.min_close_var,
             command=self.apply_config,
         ).pack(anchor="w")
         self.startup_var = tk.BooleanVar(value=self.config.get("run_on_startup", False))
         ttk.Checkbutton(
             win_frame,
-            text="Run on Windows Startup",
+            text="Run on System Startup (at login)",
             variable=self.startup_var,
             command=self.apply_config,
         ).pack(anchor="w")
@@ -1063,7 +1258,7 @@ class BZLobbyMonitor:
             bg="#1a1a1a",
             fg=self.colors["accent"],
             insertbackground=self.colors["highlight"],
-            font=("Consolas", 9),
+            font=(MONO_FONT, 9),
         )
         self.watch_list_text.pack(fill="x", padx=20, pady=(0, 5))
         self.watch_list_text.insert("1.0", self.config.get("watch_list", ""))
@@ -1123,7 +1318,7 @@ class BZLobbyMonitor:
             bg="#1a1a1a",
             fg=self.colors["highlight"],
             insertbackground=self.colors["highlight"],
-            font=("Consolas", 9),
+            font=(MONO_FONT, 9),
         )
         self.friend_list_text.pack(fill="x", pady=(0, 5))
         self.friend_list_text.insert("1.0", self.config.get("friend_list", ""))
@@ -1141,7 +1336,7 @@ class BZLobbyMonitor:
             bg="#1a1a1a",
             fg="#ff5555",
             insertbackground=self.colors["highlight"],
-            font=("Consolas", 9),
+            font=(MONO_FONT, 9),
         )
         self.ban_list_text.pack(fill="x", pady=(0, 5))
         self.ban_list_text.insert("1.0", self.config.get("ban_list", ""))
@@ -1156,7 +1351,7 @@ class BZLobbyMonitor:
             bg="#1a1a1a",
             fg="#ff5555",
             insertbackground=self.colors["highlight"],
-            font=("Consolas", 9),
+            font=(MONO_FONT, 9),
         )
         self.griefer_ids_text.pack(fill="x", pady=(0, 5))
         self.griefer_ids_text.insert("1.0", self.config.get("griefer_ids", ""))
@@ -1512,19 +1707,81 @@ class BZLobbyMonitor:
             foreground="gray",
         ).pack(side="bottom", pady=10)
 
+    @staticmethod
+    def _sort_key(value):
+        # Numbers (IDs, "3/8" player counts) sort numerically, text
+        # alphabetically; mixed columns no longer raise TypeError.
+        text = str(value)
+        m = re.match(r"\s*(-?\d+)", text)
+        if m:
+            return (0, int(m.group(1)), text.lower())
+        return (1, 0, text.lower())
+
     def sort_tree(self, col, reverse):
-        l = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
-        try:
-            l.sort(key=lambda t: int(t[0]) if t[0].isdigit() else t[0], reverse=reverse)
-        except ValueError:
-            l.sort(reverse=reverse)
-
-        for index, (val, k) in enumerate(l):
-            self.tree.move(k, '', index)
-
+        self.sort_state = (col, reverse)
+        self._apply_sort()
         self.tree.heading(col, command=lambda: self.sort_tree(col, not reverse))
 
+    def _apply_sort(self):
+        if not self.sort_state:
+            return
+        col, reverse = self.sort_state
+        rows = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
+        rows.sort(key=lambda t: self._sort_key(t[0]), reverse=reverse)
+        for index, (_, k) in enumerate(rows):
+            self.tree.move(k, "", index)
+
+    def _on_filter_changed(self):
+        self.refresh_tree()
+        self.save_ui_config()
+
+    def _attach_autosave(self):
+        """Persist typed settings without needing a Save button.
+
+        Spinboxes and entries used to only reach the config (and the bot /
+        relay threads) when a checkbox or Save button was clicked, so edits
+        were silently lost on quit.
+        """
+        tracked = [
+            self.game_var, self.name_var, self.host_var,
+            self.reconnect_delay_var, self.proxy_host_var, self.proxy_port_var,
+            self.log_folder_var, self.log_ret_var,
+            self.sound_join_var, self.sound_mention_var, self.sound_griefer_var,
+            self.discord_token_var, self.discord_channel_id_var, self.discord_lobby_id_var,
+            self.bot_welcome_var, self.bot_welcome_cooldown_var,
+            self.bot_announce_msg_var, self.bot_announce_int_var,
+            self.bot_event_msg_var, self.bot_event_start_var, self.bot_event_end_var,
+            self.bot_event_int_var, self.auto_claim_name_var, self.auto_claim_bot_name_var,
+            self.rpc_id_var,
+        ]
+        for var in tracked:
+            var.trace_add("write", lambda *_: self._schedule_save())
+        for widget in (
+            self.watch_list_text, self.friend_list_text,
+            self.ban_list_text, self.griefer_ids_text,
+        ):
+            widget.bind("<KeyRelease>", lambda e: self._schedule_save(), add="+")
+            widget.bind("<FocusOut>", lambda e: self._schedule_save(), add="+")
+
+    def _schedule_save(self, delay_ms=800):
+        if self._save_after_id is not None:
+            try:
+                self.root.after_cancel(self._save_after_id)
+            except Exception:
+                pass
+        self._save_after_id = self.root.after(delay_ms, self._autosave)
+
+    def _autosave(self):
+        self._save_after_id = None
+        try:
+            self.save_ui_config()
+        except Exception:
+            traceback.print_exc()
+
     def save_ui_config(self):
+        self.config["player_name"] = self.name_var.get()
+        self.config["lobby_game"] = self.game_var.get()
+        self.config["lobby_host"] = self.host_var.get()
         self.config["proxy_enabled"] = self.proxy_enabled_var.get()
         self.config["ip_safety"] = self.ip_safety_var.get()
         self.config["auto_reconnect"] = self.auto_reconnect_var.get()
@@ -1606,7 +1863,12 @@ class BZLobbyMonitor:
                     if getattr(sys, "frozen", False):
                         path = f'"{sys.executable}"'
                     else:
-                        path = f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
+                        # pythonw avoids a stray console window at every login.
+                        exe = sys.executable
+                        pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+                        if os.path.exists(pythonw):
+                            exe = pythonw
+                        path = f'"{exe}" "{os.path.abspath(sys.argv[0])}"'
                     winreg.SetValueEx(key, "BZLobbyMonitor", 0, winreg.REG_SZ, path)
                 else:
                     try:
@@ -1636,14 +1898,49 @@ class BZLobbyMonitor:
                         os.remove(desktop_file)
             except Exception as e:
                 self.log(f"Startup setup error: {e}")
+        elif sys.platform == "darwin":
+            try:
+                agents_dir = os.path.expanduser("~/Library/LaunchAgents")
+                plist_path = os.path.join(agents_dir, "com.grizzlyone95.bzlobbymonitor.plist")
+                if enable:
+                    os.makedirs(agents_dir, exist_ok=True)
+                    if getattr(sys, "frozen", False):
+                        args = [sys.executable]
+                    else:
+                        args = [sys.executable, os.path.abspath(sys.argv[0])]
+                    with open(plist_path, "wb") as f:
+                        plistlib.dump(
+                            {
+                                "Label": "com.grizzlyone95.bzlobbymonitor",
+                                "ProgramArguments": args,
+                                "RunAtLoad": True,
+                                "ProcessType": "Interactive",
+                            },
+                            f,
+                        )
+                elif os.path.exists(plist_path):
+                    os.remove(plist_path)
+            except Exception as e:
+                self.log(f"Startup setup error: {e}")
 
     def on_window_close_attempt(self):
-        self.root.iconify()
         if HAS_TRAY and self.tray_icon:
+            # Restored from the tray icon's "Show" item.
             self.root.withdraw()
-            # Tray icon runs in background thread, no action needed
+        else:
+            # No tray (macOS, or Linux without a tray backend): keep it in the
+            # Dock/taskbar so it can always be brought back.
+            self.root.iconify()
 
-    def trigger_alert(self, alert_type, data=None):
+    def show_window(self, *args):
+        self.root.deiconify()
+        self.root.lift()
+        try:
+            self.root.focus_force()
+        except Exception:
+            pass
+
+    def trigger_alert(self, alert_type, data=None, uid=None):
         should_alert = False
         sound_key = None
 
@@ -1652,11 +1949,9 @@ class BZLobbyMonitor:
         elif alert_type == "player_join" and self.config.get("alert_player_join"):
             sound_key = "sound_join"
             if self.config.get("alert_watch_only"):
-                watch_list = self.config.get("watch_list", "").lower().splitlines()
-                # data is player name
-                if data and any(
-                    w.strip() in str(data).lower() for w in watch_list if w.strip()
-                ):
+                # The watch list takes names or IDs (data is the player name).
+                watch_list = parse_id_list(self.config.get("watch_list", ""))
+                if list_matches(watch_list, data, uid):
                     should_alert = True
             else:
                 should_alert = True
@@ -1668,8 +1963,7 @@ class BZLobbyMonitor:
 
         if should_alert:
             if self.config.get("alert_sound"):
-                self.root.bell()
-            if self.config.get("alert_sound"):
+                # Plays the custom sound, or a single system bell.
                 self.play_custom_sound(sound_key)
             if self.config.get("alert_flash"):
                 self.flash_window()
@@ -1678,10 +1972,9 @@ class BZLobbyMonitor:
         played = False
         if config_key:
             path = self.config.get(config_key, "")
-            if path and os.path.exists(path) and sys.platform == "win32":
+            if path and os.path.exists(path):
                 try:
-                    winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
-                    played = True
+                    played = play_wav_file(path)
                 except Exception:
                     pass
 
@@ -1701,30 +1994,56 @@ class BZLobbyMonitor:
                 pass
 
     def quit_app(self):
+        # Save what's in the UI (not just the last saved config) so typed
+        # settings aren't lost.
+        try:
+            self.save_ui_config()
+        except Exception:
+            self.save_config()
         self.app_running = False
         self.should_run = False
         self.conn_gen += 1
+        ws = self.ws
+        self.ws = None
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        if self.rpc:
+            try:
+                self.rpc.close()
+            except Exception:
+                pass
         if self.tray_icon:
-            self.tray_icon.stop()
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
         if self.tor_process:
             self.stop_tor()
-        self.save_config()
         self.root.destroy()
         sys.exit(0)
 
     def on_game_select(self, event):
         game = self.game_var.get()
-        if game == "Battlezone 98 Redux":
-            self.host_var.set("battlezone98mp.webdev.rebellion.co.uk:1337")
-        elif game == "Battlezone Combat Commander":
-            self.host_var.set("battlezone99mp.webdev.rebellion.co.uk:61111")
+        # Switching games while connected would leave the old game's monitor
+        # running and mix both games' lobbies in the list.
+        if self.should_run:
+            self.disconnect()
+        self.lobbies = {}
+        self.update_current_lobby(None)
+        self.refresh_tree()
+        if game in DEFAULT_HOSTS:
+            self.host_var.set(DEFAULT_HOSTS[game])
+        self.save_ui_config()
 
     def setup_tray(self):
         if not HAS_TRAY:
             return
 
         def show_window(icon, item):
-            self.call_in_ui(self.root.deiconify)
+            self.call_in_ui(self.show_window)
 
         def quit_tray(icon, item):
             self.call_in_ui(self.quit_app)
@@ -1738,13 +2057,23 @@ class BZLobbyMonitor:
                 pass
 
         if image:
-            menu = (item("Show", show_window), item("Quit", quit_tray))
+            menu = (item("Show", show_window, default=True), item("Quit", quit_tray))
             self.tray_icon = pystray.Icon("name", image, "BZ Monitor", menu)
             threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
-    def create_lobby(self, name=None):
+    def _require_ws(self, button=None):
+        """Lobby actions only exist on the BZ98R WebSocket connection."""
         if not self.connected:
-            self.flash_button_text(self.create_btn, "Not Connected")
+            self.flash_button_text(button, "Not Connected")
+            return False
+        if not self.ws:
+            # BZCC (HTTP/UDP) monitoring is read-only.
+            self.flash_button_text(button, "BZ98R Only")
+            return False
+        return True
+
+    def create_lobby(self, name=None):
+        if not self._require_ws(self.create_btn):
             return
 
         if name is None:
@@ -1765,12 +2094,14 @@ class BZLobbyMonitor:
             },
         }
         if self.ws and self.connected:
+            # set_lobby_metadata needs the name we asked for (auto-claim
+            # passes its own, which may differ from the New Lobby box).
+            self.pending_lobby_name = name
             self.ws.send(json.dumps(msg))
             self.log(f"Requesting Create Lobby: {name}")
 
     def join_selected_lobby(self):
-        if not self.connected:
-            self.flash_button_text(self.join_btn, "Not Connected")
+        if not self._require_ws(self.join_btn):
             return
 
         selected_items = self.tree.selection()
@@ -1783,11 +2114,7 @@ class BZLobbyMonitor:
             self.flash_button_text(self.join_btn, "Already in Lobby")
             return
 
-        val = self.tree.item(selected_items[0])["values"][0]
-        try:
-            lid = int(val)
-        except ValueError:
-            lid = str(val)
+        lid = self._server_lobby_id(selected_items[0])
 
         msg = {"type": "DoJoinLobby", "content": {"id": lid, "password": ""}}
         if self.ws and self.connected:
@@ -1799,7 +2126,8 @@ class BZLobbyMonitor:
         if not selected_items:
             return None, None
 
-        lid = str(self.tree.item(selected_items[0])["values"][0])
+        # Rows use the lobby id as their item id.
+        lid = str(selected_items[0])
         return lid, self.lobbies.get(lid)
 
     def join_steam_lobby(self):
@@ -1813,7 +2141,8 @@ class BZLobbyMonitor:
 
         url = build_steam_join_url(lid, lobby)
         self.log(f"Opening Steam URL: {url}")
-        webbrowser.open(url)
+        if not open_external(url):
+            self.log("Could not open Steam. Is it installed?")
 
     def copy_lobby_share_text(self):
         lid, lobby = self.get_selected_lobby()
@@ -1887,7 +2216,10 @@ class BZLobbyMonitor:
                                 command=lambda: self.kick_user(uid, name),
                             )
 
-                menu.post(event.x_root, event.y_root)
+                try:
+                    menu.tk_popup(event.x_root, event.y_root)
+                finally:
+                    menu.grab_release()
         except Exception as e:
             print(f"Context menu error: {e}")
 
@@ -1916,7 +2248,7 @@ class BZLobbyMonitor:
 
     def whisper_user(self, name):
         if not (self.ws and self.connected):
-            self.log("Whisper failed: not connected.")
+            self.log("Whisper failed: not connected to a BZ98R lobby server.")
             return
         msg = simpledialog.askstring("Whisper", f"Message to {name}:")
         if msg and self.ws and self.connected:
@@ -1937,7 +2269,7 @@ class BZLobbyMonitor:
 
     def kick_user(self, uid, name):
         if not (self.ws and self.connected):
-            self.log("Kick failed: not connected.")
+            self.log("Kick failed: not connected to a BZ98R lobby server.")
             return
         if messagebox.askyesno("Kick User", f"Are you sure you want to kick {name}?"):
             self.ws.send(
@@ -1951,8 +2283,7 @@ class BZLobbyMonitor:
             self.log(f"Kicked {name}")
 
     def leave_or_refresh_lounge(self):
-        if not self.connected:
-            self.flash_button_text(self.leave_btn, "Not Connected")
+        if not self._require_ws(self.leave_btn):
             return
 
         if self.current_lobby_id is not None:
@@ -1966,9 +2297,8 @@ class BZLobbyMonitor:
             self.ws.send(json.dumps(msg))
 
     def send_chat(self, event=None):
-        if not self.connected:
-            if hasattr(self, "send_chat_btn"):
-                self.flash_button_text(self.send_chat_btn, "Not Connected")
+        # Don't clear the box (losing the message) when it can't be sent.
+        if not self._require_ws(self.send_chat_btn):
             return
 
         text = self.chat_var.get()
@@ -1985,8 +2315,7 @@ class BZLobbyMonitor:
             self.ws.send(json.dumps(msg))
 
     def ping_server(self):
-        if not self.connected:
-            self.flash_button_text(self.ping_btn, "Not Connected")
+        if not self._require_ws(self.ping_btn):
             return
 
         if self.ws and self.connected:
@@ -2003,7 +2332,7 @@ class BZLobbyMonitor:
                 if tag.startswith("url:"):
                     url = tag[4:]
                     if is_safe_link(url):
-                        webbrowser.open(url)
+                        open_external(url)
                     else:
                         self.log(f"Blocked non-web link: {url}")
         except Exception as e:
@@ -2029,6 +2358,7 @@ class BZLobbyMonitor:
         # Parse URLs and Mentions
         parts = re.split(r"(https?://\S+)", text)
         my_name = self.name_var.get().lower()
+        mentioned = False
 
         for part in parts:
             if part.startswith("http"):
@@ -2037,23 +2367,34 @@ class BZLobbyMonitor:
                 # Check mentions (case-insensitive)
                 if my_name and my_name in part.lower():
                     self.log_text.insert("end", part, "mention")
-                    if self.config.get("alert_sound"):
-                        self.play_custom_sound("sound_mention")
+                    mentioned = True
                 else:
                     self.log_text.insert("end", part)
 
         self.log_text.insert("end", "\n")
+        self._trim_log()
         self.log_text.see("end")
         self.log_text.config(state="disabled")
+
+        # One sound per message, and not for our own messages.
+        if mentioned and self.config.get("alert_sound") and str(author).lower() != my_name:
+            self.play_custom_sound("sound_mention")
 
         # File Log
         if self.config.get("logging_enabled", False):
             self._file_log(f"[CHAT] {author}: {text}")
 
+    def _trim_log(self):
+        # Keep long passive sessions from growing the widget without bound.
+        lines = int(self.log_text.index("end-1c").split(".")[0])
+        if lines > MAX_LOG_LINES:
+            self.log_text.delete("1.0", f"{lines - MAX_LOG_LINES + 1}.0")
+
     def _log_impl(self, message):
         # UI Log
         self.log_text.config(state="normal")
         self.log_text.insert("end", message + "\n")
+        self._trim_log()
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
@@ -2164,6 +2505,9 @@ class BZLobbyMonitor:
 
     def _start_connection(self, mode, host, gen):
         self.connect_btn.config(text="Disconnect")
+        self.bzcc_primed = False
+        self.last_http_game_count = None
+        self.raknet_query_logged = False
         if mode == "ws":
             url = f"ws://{host}"
             self.log(f"Connecting to {url}...")
@@ -2196,8 +2540,16 @@ class BZLobbyMonitor:
             except Exception:
                 pass
         self.connected = False
+        self._reset_session_state()
         self._set_disconnected_ui()
         self.log("Disconnected.")
+
+    def _reset_session_state(self):
+        # We're no longer in any lobby once the connection is gone; leaving
+        # "In Lobby" up would also block Join after reconnecting.
+        self.my_id = None
+        if self.current_lobby_id is not None:
+            self.update_current_lobby(None)
 
     def _set_disconnected_ui(self):
         self.connect_btn.config(text="Connect")
@@ -2217,6 +2569,7 @@ class BZLobbyMonitor:
             return  # an old worker; a newer connection (or disconnect) owns the UI
         self.connected = False
         self.ws = None
+        self._reset_session_state()
         self.log(f"{source} stopped.")
         if not self.should_run:
             self._set_disconnected_ui()
@@ -2266,7 +2619,7 @@ class BZLobbyMonitor:
         payload_ent.pack(side="left", padx=5)
 
         # Log
-        log_area = tk.Text(win, bg="#000", fg="#0f0", font=("Consolas", 9))
+        log_area = tk.Text(win, bg="#000", fg="#0f0", font=(MONO_FONT, 9))
         log_area.pack(fill="both", expand=True, padx=10, pady=10)
 
         def clean_payload(p_str):
@@ -2290,11 +2643,17 @@ class BZLobbyMonitor:
             return clean
 
         def send_packet():
-            h_str = host_ent.get()
+            if self.config.get("ip_safety", False):
+                log_area.insert(
+                    "end",
+                    "Blocked: IP Safety is on and raw UDP can't go through a proxy.\n",
+                )
+                return
+            h_str = host_ent.get().strip()
             p_str = clean_payload(payload_ent.get())
 
-            host, port = h_str.split(":") if ":" in h_str else (h_str, 61111)
             try:
+                host, _, port = h_str.rpartition(":") if ":" in h_str else (h_str, "", 61111)
                 port = int(port)
                 payload = bytes.fromhex(p_str)
 
@@ -2470,6 +2829,7 @@ class BZLobbyMonitor:
             False  # set True on rx to trigger immediate send without waiting 1s tick
         )
         last_http_poll = 0  # track HTTP poll time independently of query cycle
+        last_game_list = None
         HTTP_POLL_INTERVAL = (
             3  # seconds — fast enough for near-real-time player join/leave detection
         )
@@ -2531,10 +2891,12 @@ class BZLobbyMonitor:
                         self.tx_rel_seq = (self.tx_rel_seq + 1) & 0xFFFFFF
                         base = self.raknet_query if self.raknet_query else pkt_query
                         pkt = self.patch_raknet_packet(base, self.tx_rel_seq)
-                        self.log(
-                            "Sending Query (0x60) — polling HTTP for lobby data..."
-                        )
+                        if not self.raknet_query_logged:
+                            self.log(
+                                "Sending Query (0x60) — polling HTTP for lobby data..."
+                            )
                         pkt_mode = 7
+                        self.raknet_query_logged = True  # re-sent every few seconds; log once
                         self.start_http_lobby_poll()
                         last_http_poll = time.time()
 
@@ -2614,10 +2976,12 @@ class BZLobbyMonitor:
                             sock.sendto(ack_pkt, (host, port))
 
                             frames = parse_raknet_frames(data)
-                            is_ping_pong = all(
-                                f and f[0] in [0x00, 0x03] for f in frames
+                            # Pings and the periodic game-list reply arrive every
+                            # few seconds; don't flood the chat log with them.
+                            is_routine = all(
+                                f and f[0] in (0x00, 0x03, 0x61) for f in frames
                             )
-                            if not is_ping_pong:
+                            if not is_routine:
                                 self.log(
                                     f"RX FrameSet {len(data)}b (ID: {hex(pid)}) Seq: {seq_num} -> Sent ACK"
                                 )
@@ -2632,12 +2996,16 @@ class BZLobbyMonitor:
                                         pkt_mode = 5
                                         send_now = True  # send login immediately
                                 elif msg_id == 0x61:
-                                    self.log("  -> Game List Response (0x61)")
                                     payload = frame[1:]
-                                    self.log(f"  -> Raw Data: {payload.hex()}")
+                                    changed = payload != last_game_list
+                                    last_game_list = payload
+                                    if changed:
+                                        self.log("  -> Game List Response (0x61)")
+                                        self.log(f"  -> Raw Data: {payload.hex()}")
                                     if len(payload) >= 4:
                                         count = int.from_bytes(payload[:4], "little")
-                                        self.log(f"  -> Lobby Count: {count}")
+                                        if changed:
+                                            self.log(f"  -> Lobby Count: {count}")
                                         if count > 0:
                                             self.start_http_lobby_poll()
                                             last_http_poll = time.time()
@@ -2658,6 +3026,7 @@ class BZLobbyMonitor:
 
         sock.close()
         self.call_in_ui(self._on_worker_stopped, gen, "RakNet Monitor")
+
 
     def run_bzcc_http(self, url, gen):
         self.connected = True
@@ -2698,6 +3067,13 @@ class BZLobbyMonitor:
         old_lobby_ids = set(k for k in self.lobbies if not k.startswith("direct_"))
         new_lobby_ids = set(new_lobbies.keys())
 
+        if not self.bzcc_primed:
+            # First snapshot of this connection: these games already existed,
+            # so don't fire a "new lobby" alert (and sound) for every one.
+            self.bzcc_primed = True
+            self.log(f"[BZCC] {len(new_lobbies)} game(s) listed.")
+            old_lobby_ids = new_lobby_ids
+
         for lid in new_lobby_ids - old_lobby_ids:
             lobby = new_lobbies[lid]
             lname = lobby["metadata"].get("name", lid)
@@ -2710,6 +3086,8 @@ class BZLobbyMonitor:
             self.log(f"[BZCC] Game ended: {lname}")
 
         for lid in new_lobby_ids & old_lobby_ids:
+            if lid not in self.lobbies:
+                continue
             old_users = self.lobbies[lid].get("users", {})
             new_users = new_lobbies[lid].get("users", {})
             lname = new_lobbies[lid]["metadata"].get("name", lid)
@@ -2718,7 +3096,7 @@ class BZLobbyMonitor:
                 if pid not in old_users:
                     pname = pdata.get("name", pid)
                     self.log(f"[BZCC] {pname} joined {lname}")
-                    self.trigger_alert("player_join", pname)
+                    self.trigger_alert("player_join", pname, pid)
 
             for pid, pdata in old_users.items():
                 if pid not in new_users:
@@ -2762,9 +3140,13 @@ class BZLobbyMonitor:
             on_message=lambda ws, msg: self.call_in_ui(self._on_message_ui, ws, msg, gen),
             on_error=lambda ws, err: self.log(f"WebSocket Error: {err}"),
         )
-        self.ws = ws_app
+        if gen == self.conn_gen:
+            self.ws = ws_app
         try:
-            ws_app.run_forever(**proxy_opts)
+            # Pings detect a silently dropped connection (sleep, Wi-Fi
+            # change); without them the app shows "Connected" forever and
+            # auto-reconnect never fires.
+            ws_app.run_forever(ping_interval=30, ping_timeout=10, **proxy_opts)
         except Exception as e:
             self.log(f"WebSocket Error: {e}")
         self.call_in_ui(self._on_worker_stopped, gen, "WebSocket")
@@ -2987,7 +3369,8 @@ class BZLobbyMonitor:
             return
 
         text = str(chat.get("text", ""))
-        self.log(f"[CHAT] {author}: {text}")
+        # log_chat writes both the chat pane and the file log; logging it
+        # through self.log too showed every message twice.
         self.log_chat(author, text)
 
         # Don't bounce messages we relayed from Discord back to Discord.
@@ -3009,8 +3392,10 @@ class BZLobbyMonitor:
         member = "" if member is None else str(member)
         action = "left" if data.get("removed") else "joined"
         self.log(f"User {member} {action} lobby {lid}")
-        if not data.get("removed"):
-            self.trigger_alert("player_join", member)
+        # Our own join must not alert, greet ourselves, or be auto-banned.
+        is_self = self.my_id is not None and str(uid) == str(self.my_id)
+        if not data.get("removed") and not is_self:
+            self.trigger_alert("player_join", member, uid)
             self.check_auto_ban_join(lid, uid, member)
 
             # Bot Welcome
@@ -3083,6 +3468,13 @@ class BZLobbyMonitor:
     def _auto_kick(self, uid, name, reason):
         if not (self.ws and self.connected):
             return
+        if self.my_id is not None and str(uid) == str(self.my_id):
+            return
+        # Lobby updates arrive in bursts; send one kick, not one per update.
+        now = time.time()
+        if now - self.recent_kicks.get(str(uid), 0) < 15:
+            return
+        self.recent_kicks[str(uid)] = now
         self.log(f"!!! KICKING {name} (ID: {uid}) - Reason: {reason} !!!")
         self.ws.send(
             json.dumps(
@@ -3103,7 +3495,8 @@ class BZLobbyMonitor:
 
     def set_lobby_metadata(self, lobby_id):
         # Set default metadata for created lobbies (similar to ChatManager.js)
-        name = self.new_lobby_var.get()
+        name = self.pending_lobby_name or self.new_lobby_var.get()
+        self.pending_lobby_name = None
         full_name = f"~chat~pub~~{name}"
         meta_updates = [
             {"key": "clientVersion", "value": "2.2.301"},
@@ -3144,21 +3537,20 @@ class BZLobbyMonitor:
                 .get("name", f"ID: {lobby_id}")
             )
             self.call_in_ui(
-                lambda: self.current_lobby_var.set(f"In Lobby: {lobby_name}")
+                lambda: self.current_lobby_var.set(f"In Lobby: {clean_lobby_name(lobby_name)}")
             )
             self.call_in_ui(lambda: self.leave_btn.config(text="Leave Lobby"))
-            self.update_rpc(f"In Lobby: {lobby_name}", "Playing Battlezone 98 Redux")
+            self.update_rpc(f"In Lobby: {clean_lobby_name(lobby_name)}", f"Playing {self.game_var.get()}")
         else:
             self.call_in_ui(lambda: self.current_lobby_var.set("In Lounge"))
             self.call_in_ui(lambda: self.leave_btn.config(text="Refresh Lounge"))
             self.update_rpc("In Lounge", "Browsing Lobbies")
 
     def refresh_tree(self):
-        # Save selection
+        # Save selection and scroll position (rows are rebuilt every update)
         selected_items = self.tree.selection()
-        selected_id = None
-        if selected_items:
-            selected_id = self.tree.item(selected_items[0])["values"][0]
+        selected_id = selected_items[0] if selected_items else None
+        scroll_top = self.tree.yview()[0]
 
         # Clear
         for row_id in self.tree.get_children():
@@ -3205,16 +3597,19 @@ class BZLobbyMonitor:
             player_count = f"{len(users)}/{lobby.get('memberLimit', '?')}"
 
             game_type = meta.get("gameType", "?")
-            version = lobby.get("clientVersion", "?")
+            version = extract_lobby_version(lobby)
             locked = "Yes" if lobby.get("isLocked") else "No"
             is_private = "Yes" if lobby.get("isPrivate") else "No"
 
             map_name = extract_map_name_from_metadata(meta, default="?")
 
             tags = ("friend",) if has_friend else ()
+            # The lobby id is the row id, so lookups never depend on Tk
+            # turning "0123"-style ids into numbers.
             self.tree.insert(
                 "",
                 "end",
+                iid=str(lid),
                 values=(
                     lid,
                     name,
@@ -3229,12 +3624,11 @@ class BZLobbyMonitor:
                 tags=tags,
             )
 
-        # Restore selection if possible
-        if selected_id:
-            for row_id in self.tree.get_children():
-                if str(self.tree.item(row_id)["values"][0]) == str(selected_id):
-                    self.tree.selection_set(row_id)
-                    break
+        # Keep the user's chosen sort order, selection and scroll position.
+        self._apply_sort()
+        if selected_id and self.tree.exists(selected_id):
+            self.tree.selection_set(selected_id)
+        self.tree.yview_moveto(scroll_top)
         self.refresh_waiting_room()
 
     def refresh_waiting_room(self):
@@ -3275,10 +3669,9 @@ class BZLobbyMonitor:
         if not selected_items:
             return
 
-        lid = str(self.tree.item(selected_items[0])["values"][0])
-        lobby = self.lobbies.get(lid)
+        lobby = self.lobbies.get(str(selected_items[0]))
 
-        if lobby:
+        if isinstance(lobby, dict):
             self.update_lobby_details(lobby)
             self.update_player_details(lobby)
 
@@ -3318,6 +3711,8 @@ class BZLobbyMonitor:
 
         # Check for cached image to display in label
         l_meta = lobby.get("metadata", {})
+        if not isinstance(l_meta, dict):
+            l_meta = {}
         game_settings = l_meta.get("gameSettings")
         mod_id = None
         if game_settings:
@@ -3636,15 +4031,27 @@ class BZLobbyMonitor:
             self.save_ui_config()
             messagebox.showinfo(
                 "Tor Proxy",
-                "Proxy set to 127.0.0.1:9050 (SOCKS5).\nEnsure the 'tor' service is running on your system.",
+                "Proxy set to 127.0.0.1:9050 (SOCKS5).\n"
+                "Make sure the 'tor' service is running "
+                + ("(brew install tor && brew services start tor)." if sys.platform == "darwin"
+                   else "(e.g. sudo apt install tor).")
+                + "\nIf you use Tor Browser instead, change the port to 9150.",
             )
 
     def manage_tor_windows(self):
-        bin_dir = os.path.join(APP_DIR, "bin", "tor")
+        bin_dir = os.path.join(DATA_DIR, "bin", "tor")
         tor_exe = os.path.join(bin_dir, "tor.exe")
+        legacy_dir = os.path.join(APP_DIR, "bin", "tor")
+        if not os.path.exists(tor_exe) and os.path.exists(os.path.join(legacy_dir, "tor.exe")):
+            bin_dir, tor_exe = legacy_dir, os.path.join(legacy_dir, "tor.exe")
 
         if os.path.exists(tor_exe):
             self._finish_tor_setup(bin_dir)
+            return
+
+        if self.tor_downloading:
+            # A second click would start a second download writing the same files.
+            self.log("Tor download already in progress...")
             return
 
         if not messagebox.askyesno(
@@ -3654,10 +4061,14 @@ class BZLobbyMonitor:
             return
 
         def worker():
-            ok = self.download_tor(bin_dir)
+            try:
+                ok = self.download_tor(bin_dir)
+            finally:
+                self.tor_downloading = False
             if ok:
                 self.call_in_ui(self._finish_tor_setup, bin_dir)
 
+        self.tor_downloading = True
         threading.Thread(target=worker, daemon=True).start()
 
     def _finish_tor_setup(self, bin_dir):
@@ -3725,8 +4136,12 @@ class BZLobbyMonitor:
                     src = tar.extractfile(member)
                     if src is None:
                         continue
-                    with open(os.path.join(target_dir, base), "wb") as out:
+                    # Write then rename, so an interrupted extract never leaves
+                    # a truncated tor.exe that looks installed next time.
+                    dest = os.path.join(target_dir, base)
+                    with open(dest + ".part", "wb") as out:
                         out.write(src.read())
+                    os.replace(dest + ".part", dest)
 
             self.log("Tor installed successfully (SHA-256 verified).")
             return True
@@ -3745,7 +4160,7 @@ class BZLobbyMonitor:
         return torrc_path
 
     def start_tor(self, exe_path, cwd):
-        if self.tor_process:
+        if self.tor_process and self.tor_process.poll() is None:
             return  # Already running
 
         self.log("Starting Tor process...")
@@ -3757,6 +4172,7 @@ class BZLobbyMonitor:
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 kwargs["startupinfo"] = startupinfo
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
             self.tor_process = subprocess.Popen(
                 [exe_path, "-f", torrc_path],
@@ -3848,10 +4264,11 @@ class BZLobbyMonitor:
             return False
 
     def test_proxy(self):
-        host = self.proxy_host_var.get()
-        port = self.proxy_port_var.get()
+        host = self.proxy_host_var.get().strip()
+        port = self.proxy_port_var.get().strip()
         ptype = self.config.get("proxy_type", "http")
         if not host or not port:
+            messagebox.showwarning("Test Proxy", "Enter a proxy Host and Port first.")
             return
 
         def run_test():
@@ -3961,7 +4378,7 @@ class BZLobbyMonitor:
         folder = str(self.config.get("log_folder", "")).strip()
         if folder and os.path.isdir(folder):
             return folder
-        return APP_DIR
+        return DATA_DIR
 
     def get_stats_file(self):
         return os.path.join(self.get_log_folder(), "bzr_stats.csv")
@@ -4096,6 +4513,7 @@ class BZLobbyMonitor:
     def test_discord_connection(self):
         token = self.discord_token_var.get().strip()
         if not token:
+            messagebox.showwarning("Discord", "Enter a Bot Token first.")
             return
 
         def worker():
@@ -4119,17 +4537,23 @@ class BZLobbyMonitor:
         token = self.discord_token_var.get().strip()
         chan_id = self.discord_channel_id_var.get().strip()
         if not token or not chan_id.isdigit():
-            return
+            return False
         # allowed_mentions blocks @everyone/@here/role pings from relayed chat.
         payload = build_discord_message_payload(message=message, embed=embed)
 
         def _send():
             try:
                 self._discord_request(token, f"/channels/{chan_id}/messages", payload)
+                self.discord_last_send_error = None
             except Exception as e:
-                print(f"Discord Send Error: {e}")
+                # Surface failures in the app (print() is invisible in the
+                # windowed builds), once per distinct error.
+                if str(e) != self.discord_last_send_error:
+                    self.discord_last_send_error = str(e)
+                    self.log(f"Discord send failed: {e}")
 
         threading.Thread(target=_send, daemon=True).start()
+        return True
 
     def post_lobby_status(self):
         if not self.connected:
@@ -4177,8 +4601,11 @@ class BZLobbyMonitor:
         if url:
             embed["description"] = f"[**Click to Join via Steam**]({url})"
 
-        self.send_to_discord(embed=embed)
-        self.log("Posted lobby status to Discord.")
+        if self.send_to_discord(embed=embed):
+            self.log("Posting lobby status to Discord...")
+        else:
+            self.flash_button_text(self.discord_status_btn, "Set Up Discord")
+            self.log("Can't post to Discord: set a Bot Token and numeric Channel ID in Discord Integration.")
 
     def discord_polling_loop(self):
         last_id = None
@@ -4255,6 +4682,7 @@ class BZLobbyMonitor:
                             start_dt = datetime.strptime(start_str, fmt)
                             end_dt = datetime.strptime(end_str, fmt)
 
+                            self.event_format_warned = False
                             if start_dt <= now <= end_dt:
                                 evt_interval = (
                                     int(self.config.get("bot_event_interval", 10) or 10) * 60
@@ -4268,7 +4696,12 @@ class BZLobbyMonitor:
                                         self.call_in_ui(self.send_chat_message, evt_msg)
                                         self.last_event_announce_time = time.time()
                     except ValueError:
-                        pass  # Invalid date format
+                        if not self.event_format_warned:
+                            self.event_format_warned = True
+                            self.log(
+                                "Event messages: Start/End must look like 2026-01-31 18:30; "
+                                "event messages are not being sent."
+                            )
                     except Exception as e:
                         print(f"Event bot error: {e}")
 
@@ -4374,16 +4807,22 @@ class BZLobbyMonitor:
             self.rpc.connect()
             self.log("Discord RPC Connected.")
         except Exception as e:
-            self.log(f"RPC Error: {e}")
+            self.rpc = None  # so toggling again retries instead of using a dead client
+            self.log(f"RPC Error (is the Discord app running?): {e}")
 
     def toggle_rpc(self):
         self.save_ui_config()
         if self.rpc_enabled_var.get():
-            if not self.rpc:
+            if not HAS_RPC:
+                self.log("Discord RPC needs the 'pypresence' package: pip install pypresence")
+            elif not self.rpc:
                 self.init_rpc()
         else:
             if self.rpc:
-                self.rpc.close()
+                try:
+                    self.rpc.close()
+                except Exception:
+                    pass
                 self.rpc = None
 
     def update_rpc(self, state, details):
@@ -4443,7 +4882,7 @@ class BZLobbyMonitor:
                 text="Statistics logging is DISABLED.\nEnable 'Game Stats Logging' in Configuration.",
                 fill="red",
                 justify="center",
-                font=("Consolas", 12, "bold"),
+                font=(MONO_FONT, 12, "bold"),
             )
             return
 
@@ -4566,11 +5005,18 @@ class BZLobbyMonitor:
             with self.open_url(req, timeout=5) as f:
                 res = json.load(f)
             if isinstance(res, dict) and "GET" in res:
-                games = res["GET"]
-                self.log(f"HTTP Lobby: Found {len(games)} games.")
+                games = res["GET"] or []
+                # Polled every few seconds; only log when the count changes.
+                if len(games) != self.last_http_game_count:
+                    self.last_http_game_count = len(games)
+                    self.log(f"HTTP Lobby: Found {len(games)} games.")
                 self.call_in_ui(self.process_bzcc_data, res)
+            self.last_http_poll_error = None
         except Exception as e:
-            self.log(f"HTTP Poll Failed: {e}")
+            # Retried every few seconds; report each distinct failure once.
+            if str(e) != getattr(self, "last_http_poll_error", None):
+                self.last_http_poll_error = str(e)
+                self.log(f"HTTP Poll Failed: {e}")
         finally:
             self.http_poll_inflight = False
 

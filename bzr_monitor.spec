@@ -9,6 +9,7 @@ a = Analysis(
     datas=[
         ('branding/app_icon.ico', 'branding'),
         ('branding/app_icon.png', 'branding'),
+        ('BZONE.ttf', '.'),
     ],
     hiddenimports=['socks', 'sockshandler', 'python_socks'],
     hookspath=[],

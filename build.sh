@@ -16,6 +16,11 @@ pip install pyinstaller
 pyinstaller --name "${APP_NAME}" \
     --onefile \
     --windowed \
+    --icon "branding/app_icon.ico" \
+    --add-data "branding/app_icon.ico:branding" \
+    --add-data "branding/app_icon.png:branding" \
+    --add-data "BZONE.ttf:." \
+    --runtime-hook branding/pyinstaller_icon_hook.py \
     --add-data "LICENSE:." \
     --add-data "README.md:." \
     --hidden-import=websocket \
@@ -25,7 +30,7 @@ pyinstaller --name "${APP_NAME}" \
     --hidden-import=sockshandler \
     --hidden-import=python_socks \
     --hidden-import=PIL \
-    bzr_monitor.py
+    bzr_monitor.py -y
 
 mkdir -p releases
 
